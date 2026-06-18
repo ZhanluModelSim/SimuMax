@@ -518,6 +518,9 @@ class PerfLLM(PerfBase):
         self._prepared_chunk_names = set()
         self._chunk_profile_model_key = None
         self._chunk_profile_system_key = None
+        self._cost_model_overrides = {}
+        self._cost_model_path_overrides = {}
+        self._overlap_summary = None
         # os.makedirs(TMP_PATH, exist_ok=True)
 
     def _vp_size(self) -> int:
@@ -535,7 +538,52 @@ class PerfLLM(PerfBase):
         # except Exception as e:
         #     print(f"删除文件时出错: {e}")
         pass
-    
+
+    def set_cost_model(self, module_class_or_name, cost_model):
+        self._cost_model_overrides[module_class_or_name] = cost_model
+
+    def set_cost_model_by_path(self, path: str, cost_model):
+        self._cost_model_path_overrides[path] = cost_model
+
+    def _apply_cost_models(self):
+        for chunk_name, model in self.model_chunk_dict.items():
+            if not hasattr(model, 'all_leaf_nodes'):
+                continue
+            for leaf in model.all_leaf_nodes:
+                full_name = getattr(leaf, 'full_name', None)
+                if full_name and full_name in self._cost_model_path_overrides:
+                    leaf.cost_model = self._cost_model_path_overrides[full_name]
+                    continue
+                cls_name = type(leaf).__name__
+                if cls_name in self._cost_model_overrides:
+                    leaf.cost_model = self._cost_model_overrides[cls_name]
+
+    def run_estimate_with_overlap(self, save_path=None):
+        from simumax.core.des_bridge import DesBridge, backfill_exposed_times
+        from simumax.core.overlap_report import OverlapReport
+
+        self.run_estimate()
+        self._apply_cost_models()
+        self._run()
+
+        num_ranks = max(1, self.strategy.pp_size)
+        des = DesBridge.from_module_costs(self, num_ranks=num_ranks)
+        overlap_summary = des.compute_overlap()
+        overlap_summary.iteration_time = des.get_iteration_time()
+
+        backfill_exposed_times(self, overlap_summary)
+        self._overlap_summary = overlap_summary
+
+        OverlapReport.print_summary(overlap_summary)
+        if save_path is None:
+            save_path = TMP_PATH
+        report_path = os.path.join(save_path, "overlap_report.json")
+        OverlapReport.generate(overlap_summary, report_path)
+        return overlap_summary
+
+    def get_overlap_report(self):
+        return self._overlap_summary
+
     def get_num_layers_to_build(
         self,
         config: StrategyConfig,

@@ -315,6 +315,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self.use_variance_tail_model = bool(strategy.recompute_variance)
         self.id = MetaModule.id_counter
         MetaModule.id_counter += 1
+        self._cost_model = None
 
     def __post_init__(self):
         self.is_leaf_module = self.set_children_modules()
@@ -334,7 +335,16 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     
     def set_variance_node(self, is_variance_node:bool):
         if self.use_variance_tail_model:
-            self.is_variance_node = is_variance_node        
+            self.is_variance_node = is_variance_node
+
+    @property
+    def cost_model(self):
+        return self._cost_model
+
+    @cost_model.setter
+    def cost_model(self, model):
+        self._cost_model = model
+
     @property
     def output_info(self):
         if self.output_info_ is None:
@@ -826,6 +836,26 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         enable_recompute=False,
     ):
         def compute_details(op_name, stage, flops, accessed_mem):
+            if self._cost_model is not None:
+                from simumax.core.cost_model import CostContext
+                ctx = CostContext(
+                    op_name=op_name,
+                    stage=stage,
+                    flops=flops,
+                    accessed_mem=accessed_mem,
+                    shape_desc=self.get_input_shapes_desc(stage),
+                    element_size=self.element_size,
+                    strategy=self.strategy,
+                    system=self.system,
+                )
+                result = self._cost_model.compute(ctx)
+                self.set_details(
+                    stage,
+                    result.details.get("compute", {}),
+                    result.details.get("io", {}),
+                )
+                return result.end2end_time
+
             #compute_details include compute time, tflops of accelerator, flops of current op, etc.
             compute_details = self.system.compute_op_accuracy_time(op_name, flops, shape_desc= self.get_input_shapes_desc(stage), reture_detail=True)
 
