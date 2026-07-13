@@ -1,5 +1,8 @@
 """Multi-resource discrete-event simulation engine for process-level performance."""
 
+import json
+import os
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
@@ -418,3 +421,120 @@ class MultiResourceDES:
             for q in self.rank_resources[r].values():
                 max_t = max(max_t, q.current_time)
         return max_t
+
+    def _events_by_rank(self) -> Dict[int, List[ResourceEvent]]:
+        events: Dict[int, List[ResourceEvent]] = {}
+        for rank, resources in self.rank_resources.items():
+            rank_events: List[ResourceEvent] = []
+            for q in resources.values():
+                rank_events.extend(q.events)
+            rank_events.sort(key=lambda e: e.start_time)
+            events[rank] = rank_events
+        return events
+
+    def export_chrome_tracing(
+        self,
+        output_dir: Optional[str] = None,
+        filename: str = "des_tracing_logs.json",
+    ) -> str:
+        """Export all DES events as Chrome Tracing JSON.
+
+        Args:
+            output_dir: Directory to write the file into.  Defaults to
+                ``./output/YYYYMMDD_HHMMSS/`` (timestamped subdirectory
+                under the current working directory).
+            filename: Name of the output JSON file.
+
+        Lane layout per rank (tid):
+          - ``compute`` — COMPUTE resource events (fwd + bwd on one lane)
+          - ``comm`` — INTRA_LINK / INTER_LINK events
+
+        Returns the absolute path to the generated file.
+        """
+        _LANE_MAP = {
+            ResourceType.COMPUTE: "compute",
+            ResourceType.INTRA_LINK: "comm",
+            ResourceType.INTER_LINK: "comm",
+        }
+
+        _LANE_SORT = {
+            "compute": 0,
+            "comm": 1,
+        }
+
+        def _resolve_lane(event: ResourceEvent) -> str:
+            return _LANE_MAP.get(event.resource, "compute")
+
+        # Resolve output directory
+        if output_dir is None:
+            ts_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join(os.getcwd(), "output", ts_dir)
+
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, filename)
+
+        tracing_events: List[dict] = []
+        event_id = 0
+
+        events_by_rank = self._events_by_rank()
+        sorted_ranks = sorted(events_by_rank.keys())
+
+        # -- metadata events --
+        for proc_idx, rank in enumerate(sorted_ranks):
+            pid = f"rank{rank}"
+            tracing_events.append({
+                "name": "process_name", "ph": "M", "pid": pid,
+                "args": {"name": pid},
+            })
+            tracing_events.append({
+                "name": "process_sort_index", "ph": "M", "pid": pid,
+                "args": {"sort_index": proc_idx},
+            })
+            tids = sorted(
+                {_resolve_lane(e) for e in events_by_rank[rank]},
+                key=lambda t: _LANE_SORT.get(t, 99),
+            )
+            for tid in tids:
+                tracing_events.append({
+                    "name": "thread_name", "ph": "M", "pid": pid, "tid": tid,
+                    "args": {"name": tid},
+                })
+                tracing_events.append({
+                    "name": "thread_sort_index", "ph": "M", "pid": pid, "tid": tid,
+                    "args": {"sort_index": _LANE_SORT.get(tid, 99)},
+                })
+
+        # -- duration events (ph="X") --
+        for rank in sorted_ranks:
+            pid = f"rank{rank}"
+            for evt in events_by_rank[rank]:
+                ts_us = evt.start_time * 1e3
+                dur_us = max(0.0, (evt.end_time - evt.start_time) * 1e3)
+                tid = _resolve_lane(evt)
+                cat = "compute" if evt.resource == ResourceType.COMPUTE else "comm"
+                tracing_events.append({
+                    "name": evt.op_name,
+                    "cat": cat,
+                    "ph": "X",
+                    "ts": ts_us,
+                    "dur": dur_us,
+                    "pid": pid,
+                    "tid": tid,
+                    "id": event_id,
+                    "args": {
+                        "module_path": evt.module_path,
+                        "stage": evt.stage,
+                        "resource": evt.resource.value,
+                        "size_bytes": evt.size_bytes,
+                        "flops": evt.flops,
+                    },
+                })
+                event_id += 1
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(tracing_events, f, indent=4, ensure_ascii=False)
+
+        event_count = sum(len(v) for v in events_by_rank.values())
+        print(f"DES: exported {event_count} events ({len(sorted_ranks)} ranks) "
+              f"→ {os.path.abspath(output_path)}")
+        return os.path.abspath(output_path)

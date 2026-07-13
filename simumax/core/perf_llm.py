@@ -558,7 +558,16 @@ class PerfLLM(PerfBase):
                 if cls_name in self._cost_model_overrides:
                     leaf.cost_model = self._cost_model_overrides[cls_name]
 
-    def run_estimate_with_overlap(self, save_path=None):
+    def run_estimate_with_overlap(self, save_path=None, output_dir=None):
+        """Run full estimate with DES overlap analysis.
+
+        Args:
+            save_path: Deprecated.  Use ``output_dir`` instead.  If neither
+                is given, results land in ``./output/YYYYMMDD_HHMMSS/``.
+            output_dir: Directory for ``overlap_report.json`` and
+                ``des_tracing_logs.json``.  If provided, takes precedence
+                over ``save_path``.
+        """
         from simumax.core.des_bridge import DesBridge, backfill_exposed_times
         from simumax.core.overlap_report import OverlapReport
 
@@ -566,7 +575,7 @@ class PerfLLM(PerfBase):
         self._apply_cost_models()
         self._run()
 
-        num_ranks = max(1, self.strategy.pp_size)
+        num_ranks = self.strategy.tp_size * max(1, self.strategy.pp_size)
         des = DesBridge.from_module_costs(self, num_ranks=num_ranks)
         overlap_summary = des.compute_overlap()
         overlap_summary.iteration_time = des.get_iteration_time()
@@ -575,10 +584,18 @@ class PerfLLM(PerfBase):
         self._overlap_summary = overlap_summary
 
         OverlapReport.print_summary(overlap_summary)
-        if save_path is None:
-            save_path = TMP_PATH
-        report_path = os.path.join(save_path, "overlap_report.json")
-        OverlapReport.generate(overlap_summary, report_path)
+
+        # Resolve output directory
+        if output_dir is not None:
+            out = output_dir
+        elif save_path is not None:
+            out = save_path
+        else:
+            out = None  # let each exporter use its own default
+
+        OverlapReport.generate(overlap_summary, output_dir=out)
+        des.export_chrome_tracing(output_dir=out)
+
         return overlap_summary
 
     def get_overlap_report(self):

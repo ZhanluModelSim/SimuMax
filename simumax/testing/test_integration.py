@@ -112,8 +112,8 @@ class TestOverlapReport(unittest.TestCase):
         summary = tracker.compute_overlap()
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            OverlapReport.generate(summary, output_dir=tmpdir, filename="report.json")
             output_path = os.path.join(tmpdir, "report.json")
-            OverlapReport.generate(summary, output_path)
             self.assertTrue(os.path.exists(output_path))
             with open(output_path, encoding="utf-8") as f:
                 data = json.load(f)

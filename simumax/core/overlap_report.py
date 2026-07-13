@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime
 from typing import Optional
 
 from simumax.core.des_engine import OverlapSummary, ResourceType
@@ -70,8 +71,16 @@ class OverlapReport:
         return report
 
     @staticmethod
-    def generate(summary: OverlapSummary, output_path: str):
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    def generate(
+        summary: OverlapSummary,
+        output_dir: Optional[str] = None,
+        filename: str = "overlap_report.json",
+    ):
+        if output_dir is None:
+            ts_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join(os.getcwd(), "output", ts_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, filename)
         report = OverlapReport.to_dict(summary)
         with open(output_path, "w") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
