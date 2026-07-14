@@ -182,6 +182,16 @@ class DesBridge:
             _chunk_total_time(model, "bwd")
             for _, model in ordered_chunks
         ]
+        # For PP>2, replicate the middle chunk so we have pp_size entries
+        if pp_size > 2 and len(forward_times) >= 3:
+            # ordered_chunks = [first, middle, last]
+            # We need   [first, middle, ..., middle, last]
+            mid_fwd = forward_times[1]
+            mid_bwd = backward_times[1]
+            last_fwd = forward_times[-1]
+            last_bwd = backward_times[-1]
+            forward_times = [forward_times[0]] + [mid_fwd] * (pp_size - 2) + [last_fwd]
+            backward_times = [backward_times[0]] + [mid_bwd] * (pp_size - 2) + [last_bwd]
 
         # Compute PP P2P time (same formula as _compute_single_batch_phase_inputs)
         p2p_time = 0.0
@@ -222,8 +232,16 @@ class DesBridge:
                 print(f"      rank{rank}: {line} μs")
             print()
 
-        # ---- Schedule each micro-batch in 1F1B order ----
-        if pp_size > 1 and mbc >= 1:
+        # ---- Dispatch by strategy ----
+        vp_size = getattr(perf_model, '_vp_size', None)
+        if vp_size is not None:
+            vp_size = vp_size()
+        else:
+            vp_size = 1
+        if vp_size > 1 and pp_size > 1:
+            return _build_vpp_des(perf_model, des, num_ranks, vp_size, pp_size,
+                                  ranks_per_stage, mbc, p2p_time)
+        elif pp_size > 1 and mbc >= 1:
             ops: List[tuple] = []
             for (rank, mb_1idx, kind), start_ms in offset.items():
                 ops.append((start_ms, rank, mb_1idx - 1, kind))
@@ -236,40 +254,78 @@ class DesBridge:
                 print(f"       ... ({len(ops)} ops total)")
             print()
 
-            # First pass: schedule all compute ops, track per-(rank,mb,kind) end time
-            total_chunk_times = [
-                _chunk_total_time(model, "fwd") + _chunk_total_time(model, "bwd")
-                for _, model in ordered_chunks
-            ]
-            pass_end: Dict[tuple, float] = {}  # (rank, mb, kind) → end_ms
+            is_async = getattr(perf_model.strategy, 'pp_comm_async', False)
+            stage_pass_end: Dict[tuple, float] = {}  # (stage_idx, mb, kind) → end_ms
 
             for start_ms, rank, mb, kind in ops:
-                # 1F1B "rank" = pipeline stage index.
-                # Map to GPU ranks: stage_idx * ranks_per_stage .. (stage_idx+1)*ranks_per_stage
-                stage_idx = rank
-                if stage_idx >= len(ordered_chunks):
+                stage_idx = rank  # 1F1B "rank" = pipeline stage index
+                # Map stage_idx to the correct chunk (pp>2 uses middle for intermediate stages)
+                if pp_size > 2 and stage_idx == 0:
+                    chunk_idx = 0
+                elif pp_size > 2 and stage_idx == pp_size - 1:
+                    chunk_idx = len(ordered_chunks) - 1
+                else:
+                    chunk_idx = min(stage_idx, max(0, len(ordered_chunks) - 2))
+                if chunk_idx >= len(ordered_chunks):
                     continue
-                _, model = ordered_chunks[stage_idx]
+                _, model = ordered_chunks[chunk_idx]
                 pass_dir = "fwd" if kind == "F" else "bwd"
-                for gpu_rank in range(
+                gpu_ranks = list(range(
                     stage_idx * ranks_per_stage,
                     min((stage_idx + 1) * ranks_per_stage, num_ranks),
-                ):
+                ))
+
+                # ---- Async P2P: inject send/recv/wait before dst compute ----
+                if is_async and p2p_time > 0:
+                    is_fwd = kind == "F"
+                    # Determine src/dst: fwd → N→N+1, bwd → N+1→N
+                    if is_fwd and stage_idx > 0:
+                        prev_stage = stage_idx - 1
+                        src_key = (prev_stage, mb, kind)
+                        if src_key in stage_pass_end:
+                            src_end = stage_pass_end[src_key]
+                            t_p2p = max(src_end, start_ms - p2p_time)
+                            prev_gpu_ranks = list(range(
+                                prev_stage * ranks_per_stage,
+                                stage_idx * ranks_per_stage,
+                            ))
+                            _inject_async_p2p(
+                                des, prev_gpu_ranks, gpu_ranks,
+                                t_p2p, p2p_time,
+                                kind, mb, prev_stage, stage_idx,
+                            )
+                    elif not is_fwd and stage_idx < pp_size - 1:
+                        next_stage = stage_idx + 1
+                        src_key = (next_stage, mb, kind)
+                        if src_key in stage_pass_end:
+                            src_end = stage_pass_end[src_key]
+                            t_p2p = max(src_end, start_ms - p2p_time)
+                            next_gpu_ranks = list(range(
+                                (stage_idx + 1) * ranks_per_stage,
+                                min((stage_idx + 2) * ranks_per_stage, num_ranks),
+                            ))
+                            _inject_async_p2p(
+                                des, next_gpu_ranks, gpu_ranks,
+                                t_p2p, p2p_time,
+                                kind, mb, stage_idx, next_stage,
+                            )
+
+                # ---- Schedule compute ----
+                for gpu_rank in gpu_ranks:
                     _advance_all_lanes_to(des, gpu_rank, start_ms)
                     DesBridge._schedule_leaves_pass(
                         des, gpu_rank, model, pass_dir, mb=mb,
                     )
-                    # Record when this pass completed (use max across TP group)
                     end_t = max(
                         q.current_time
                         for q in des.rank_resources[gpu_rank].values()
                     )
-                    pass_end[(gpu_rank, mb, kind)] = end_t
+                    # Record per-(stage_idx, mb, kind) end time
+                    prev = stage_pass_end.get((stage_idx, mb, kind), 0.0)
+                    stage_pass_end[(stage_idx, mb, kind)] = max(prev, end_t)
 
-            # Second pass: inject PP P2P between matching (mb, kind) across stages.
-            # Forward:  rank(stage N) → rank(stage N+1)
-            # Backward: rank(stage N+1) → rank(stage N)
-            if p2p_time > 0:
+            # ---- Sync P2P: still injected as a second pass ----
+            if not is_async and p2p_time > 0:
                 injections: List[tuple] = []
                 for mb in range(mbc):
                     for kind in ("F", "B"):
@@ -278,12 +334,14 @@ class DesBridge:
                             dst_rank = (stage_idx + 1) * ranks_per_stage
                             if kind == "B":
                                 src_rank, dst_rank = dst_rank, src_rank
-                            src_key = (src_rank, mb, kind)
-                            dst_key = (dst_rank, mb, kind)
-                            if src_key not in pass_end or dst_key not in pass_end:
+                            src_key = (stage_idx, mb, kind)
+                            dst_key = (stage_idx + 1, mb, kind)
+                            if src_key not in stage_pass_end or dst_key not in stage_pass_end:
                                 continue
-                            src_end = pass_end[src_key]
-                            stage_dst = dst_key[0] // max(1, ranks_per_stage)
+                            src_end = stage_pass_end[src_key]
+                            stage_dst = stage_idx + 1
+                            if kind == "B":
+                                stage_dst = stage_idx
                             dst_start = offset.get(
                                 (stage_dst, mb + 1, kind), src_end + p2p_time
                             )
@@ -292,7 +350,6 @@ class DesBridge:
                                 t_p2p, src_rank, dst_rank, mb, kind, stage_idx,
                             ))
 
-                # Sort by t_p2p so earlier injections don't block later ones
                 injections.sort(key=lambda x: x[0])
                 for t_p2p, src_rank, dst_rank, mb, kind, stage_idx in injections:
                     _schedule_inter_comm_at(
@@ -300,7 +357,7 @@ class DesBridge:
                         f"pp_{kind.lower()}_s{stage_idx}_to_s{stage_idx+1}_mb{mb}",
                         f"{kind.lower()}_mb{mb}",
                     )
-                print(f"[DES] Injected {len(injections)} PP P2P events.\n")
+                print(f"[DES] Injected {len(injections)} PP P2P events (sync).\n")
         else:
             # TP-only: schedule all MBs sequentially per rank
             for mb in range(mbc):
@@ -482,6 +539,282 @@ def _advance_all_lanes_to(des: MultiResourceDES, rank: int, t: float):
     """Advance every resource lane of *rank* to at least *t* (ms)."""
     for q in des.rank_resources[rank].values():
         q.advance_to(t)
+
+
+def _build_vpp_des(
+    perf_model: Any,
+    des: MultiResourceDES,
+    num_ranks: int,
+    vp_size: int,
+    pp_size: int,
+    ranks_per_stage: int,
+    mbc: int,
+    p2p_time: float,
+) -> MultiResourceDES:
+    """Build DES timeline for VPP interleaved scheduling.
+
+    Uses ``_compute_interleaved_sync_schedule`` to derive the schedule
+    table, then maps each (rank, virtual_chunk, mb, kind) tuple to DES events.
+    """
+    # Build physical chunk lookup by stage index
+    stage_order = ["first_stage_chunk", "middle_stage_chunk", "last_stage_chunk"]
+    ordered_chunks = sorted(
+        perf_model.model_chunk_dict.items(),
+        key=lambda kv: stage_order.index(kv[0]) if kv[0] in stage_order else 99,
+    )
+
+    # Build virtual chunk lookup: (pp_stage_idx, virtual_idx) → model
+    vpp_chunks: Dict[tuple, Any] = {}
+    if hasattr(perf_model, 'vpp_chunk_dict') and perf_model.vpp_chunk_dict:
+        for chunk_name, model in perf_model.vpp_chunk_dict.items():
+            # chunk_name format: "first_stage_chunk_v0"
+            for stage_key in stage_order:
+                if chunk_name.startswith(stage_key):
+                    stage_idx = stage_order.index(stage_key)
+                    suffix = chunk_name[len(stage_key):]
+                    if suffix.startswith("_v"):
+                        v_idx = int(suffix[2:])
+                        vpp_chunks[(stage_idx, v_idx)] = model
+                        break
+
+    if not vpp_chunks:
+        print("[DES] VPP: no virtual chunks found, falling back to physical chunks.")
+        return des
+
+    print(f"[DES] VPP: vp={vp_size}, pp={pp_size}, mbc={mbc}, "
+          f"virtual_chunks={len(vpp_chunks)}")
+
+    # Get VPP schedule from PerfLLM
+    try:
+        raw_schedules = _get_vpp_schedule(perf_model, pp_size, vp_size, mbc,
+                                          ordered_chunks, p2p_time)
+    except Exception as exc:
+        print(f"[DES] VPP schedule generation failed: {exc}")
+        print("[DES] VPP: falling back to physical-chunk 1F1B.")
+        return des
+
+    # Map schedule to DES events, interleaving PP P2P
+    is_async = getattr(perf_model.strategy, 'pp_comm_async', False)
+    stage_pass_end: Dict[tuple, float] = {}  # (stage_idx, mb, kind) → end_ms
+
+    for rank in range(pp_size):  # 1F1B "rank" = PP stage index
+        gpu_ranks = list(range(
+            rank * ranks_per_stage,
+            min((rank + 1) * ranks_per_stage, num_ranks),
+        ))
+        for entry in raw_schedules[rank]:
+            kind = entry["kind"]
+            if kind not in ("F", "B"):
+                continue
+            mb = entry["mb"] - 1  # 1-indexed → 0-indexed
+            start_ms = entry["start"]
+
+            # ---- Async P2P injection before dst stage compute ----
+            if is_async and p2p_time > 0:
+                is_fwd = kind == "F"
+                if is_fwd and rank > 0:
+                    src_key = (rank - 1, mb, kind)
+                    if src_key in stage_pass_end:
+                        src_end = stage_pass_end[src_key]
+                        t_p2p = max(src_end, start_ms - p2p_time)
+                        prev_ranks = list(range(
+                            (rank - 1) * ranks_per_stage,
+                            rank * ranks_per_stage,
+                        ))
+                        _inject_async_p2p(
+                            des, prev_ranks, gpu_ranks,
+                            t_p2p, p2p_time,
+                            kind, mb, rank - 1, rank,
+                        )
+                elif not is_fwd and rank < pp_size - 1:
+                    src_key = (rank + 1, mb, kind)
+                    if src_key in stage_pass_end:
+                        src_end = stage_pass_end[src_key]
+                        t_p2p = max(src_end, start_ms - p2p_time)
+                        next_ranks = list(range(
+                            (rank + 1) * ranks_per_stage,
+                            min((rank + 2) * ranks_per_stage, num_ranks),
+                        ))
+                        _inject_async_p2p(
+                            des, next_ranks, gpu_ranks,
+                            t_p2p, p2p_time,
+                            kind, mb, rank, rank + 1,
+                        )
+
+            # Maps stage_idx to the correct chunk
+            pass_dir = "fwd" if kind == "F" else "bwd"
+            if pp_size > 2 and rank == 0:
+                chunk_idx = 0
+            elif pp_size > 2 and rank == pp_size - 1:
+                chunk_idx = len(ordered_chunks) - 1
+            else:
+                chunk_idx = min(rank, max(0, len(ordered_chunks) - 2))
+            _, model = ordered_chunks[chunk_idx]
+
+            for gpu_rank in gpu_ranks:
+                _advance_all_lanes_to(des, gpu_rank, start_ms)
+                DesBridge._schedule_leaves_pass(
+                    des, gpu_rank, model, pass_dir, mb=mb,
+                )
+                end_t = max(
+                    q.current_time for q in des.rank_resources[gpu_rank].values()
+                )
+                prev = stage_pass_end.get((rank, mb, kind), 0.0)
+                stage_pass_end[(rank, mb, kind)] = max(prev, end_t)
+
+    # ---- Sync P2P injection ----
+    if not is_async and p2p_time > 0:
+        injections: List[tuple] = []
+        for mb in range(mbc):
+            for kind in ("F", "B"):
+                for stage_idx in range(pp_size - 1):
+                    src_rank = stage_idx * ranks_per_stage
+                    dst_rank = (stage_idx + 1) * ranks_per_stage
+                    if kind == "B":
+                        src_rank, dst_rank = dst_rank, src_rank
+                    src_key = (stage_idx, mb, kind)
+                    dst_key = (stage_idx + 1, mb, kind)
+                    if src_key not in stage_pass_end or dst_key not in stage_pass_end:
+                        continue
+                    src_end = stage_pass_end[src_key]
+                    t_p2p = src_end
+                    injections.append((t_p2p, src_rank, dst_rank, mb, kind, stage_idx))
+        injections.sort(key=lambda x: x[0])
+        for t_p2p, src_rank, dst_rank, mb, kind, stage_idx in injections:
+            _schedule_inter_comm_at(
+                des, src_rank, dst_rank, t_p2p, p2p_time,
+                f"pp_{kind.lower()}_s{stage_idx}_to_s{stage_idx+1}_mb{mb}",
+                f"{kind.lower()}_mb{mb}",
+            )
+        print(f"[DES] VPP: Injected {len(injections)} PP P2P events (sync).\n")
+
+    print(f"[DES] VPP: scheduled {len(raw_schedules)} stages.\n")
+    return des
+
+
+def _get_vpp_schedule(
+    perf_model: Any,
+    pp_size: int,
+    vp_size: int,
+    mbc: int,
+    ordered_chunks: List[tuple],
+    p2p_time: float,
+) -> List[List[dict]]:
+    """Generate VPP 1F1B schedule using the interleaved sync scheduler.
+
+    Returns:
+        List of per-rank schedule dicts with keys: kind, mb, start, duration, end,
+        chunk_idx, virtual_idx.
+    """
+    # Compute per-(stage, virtual) fwd/bwd times
+    def _vpp_chunk_time(stage_idx, v_idx, pass_dir):
+        chunk_name = list(ordered_chunks)[stage_idx][0] if stage_idx < len(ordered_chunks) else ""
+        vpp_name = f"{chunk_name}_v{v_idx}"
+        model = perf_model.vpp_chunk_dict.get(vpp_name) if hasattr(perf_model, 'vpp_chunk_dict') else None
+        if model is None and stage_idx < len(ordered_chunks):
+            model = ordered_chunks[stage_idx][1]
+        if model is None:
+            return 0.0
+        total = 0
+        leaves = list(model.all_leaf_nodes) if hasattr(model, 'all_leaf_nodes') else []
+        if pass_dir == "bwd":
+            leaves = list(reversed(leaves))
+        for leaf in leaves:
+            ci = leaf._cost_info
+            if pass_dir == "fwd":
+                t = ci.fwd_compute_time
+                if ci.fwd_net_time > 0:
+                    t += ci.fwd_net_time
+            else:
+                t = ci.bwd_grad_act_time + ci.bwd_grad_w_time
+                net = ci.bwd_grad_act_net_time + ci.bwd_grad_w_net_time
+                if net > 0:
+                    t += net
+            total += t
+        return total / 1e3  # μs → ms
+
+    # Build forward/backward times per stage (sum over virtual chunks)
+    fwd_times = []
+    bwd_times = []
+    for stage_idx in range(pp_size):
+        f_total = sum(_vpp_chunk_time(stage_idx, v, "fwd") for v in range(vp_size))
+        b_total = sum(_vpp_chunk_time(stage_idx, v, "bwd") for v in range(vp_size))
+        fwd_times.append(f_total + p2p_time)
+        bwd_times.append(b_total + p2p_time)
+
+    # Use calculate_1f1b_bubble for the outer pipeline schedule
+    _, raw_schedules = perf_model.calculate_1f1b_bubble(
+        pp_size, mbc, fwd_times, bwd_times, return_schedules=True,
+    )
+    return raw_schedules
+
+
+def _inject_async_p2p(
+    des: MultiResourceDES,
+    src_ranks: List[int],
+    dst_ranks: List[int],
+    t_p2p: float,
+    p2p_time: float,
+    kind: str,
+    mb: int,
+    src_stage: int,
+    dst_stage: int,
+):
+    """Inject async P2P send→recv→wait between two stages, inline with compute.
+
+    - async_send on src rank's INTER_LINK at t_p2p
+    - async_recv on dst rank's INTER_LINK at t_p2p
+    - COMPUTE lanes of dst ranks blocked until t_p2p + p2p_time
+    """
+    module_path = f"pp_{kind.lower()}_s{src_stage}_to_s{dst_stage}_mb{mb}"
+    stage_label = f"{kind.lower()}_mb{mb}"
+    wait_t = t_p2p + p2p_time
+
+    for r in src_ranks:
+        _schedule_event_at(
+            des, r, ResourceType.INTER_LINK,
+            t_p2p, p2p_time, "async_send",
+            module_path, stage_label,
+        )
+    for r in dst_ranks:
+        _schedule_event_at(
+            des, r, ResourceType.INTER_LINK,
+            t_p2p, p2p_time, "async_recv",
+            module_path, stage_label,
+        )
+        # Block COMPUTE lane on dst until P2P completes
+        comp_q = des.get_queue(r, ResourceType.COMPUTE)
+        comp_q.advance_to(wait_t)
+
+    print(f"  [ASYNCP2P] {kind} mb{mb} s{src_stage}→s{dst_stage}: "
+          f"t={t_p2p*1e3:.0f}μs wait@{wait_t*1e3:.0f}μs "
+          f"(src_ranks={src_ranks} dst_ranks={dst_ranks})")
+
+
+def _schedule_event_at(
+    des: MultiResourceDES,
+    rank: int,
+    resource: ResourceType,
+    start_ms: float,
+    duration_ms: float,
+    op_name: str,
+    module_path: str,
+    stage: str,
+):
+    """Insert a ResourceEvent at a specific absolute time on a single rank's queue."""
+    q = des.get_queue(rank, resource)
+    event = ResourceEvent(
+        resource=resource,
+        start_time=start_ms,
+        end_time=start_ms + duration_ms,
+        op_name=op_name,
+        module_path=module_path,
+        stage=stage,
+        rank=rank,
+    )
+    q.events.append(event)
+    q.current_time = max(q.current_time, start_ms + duration_ms)
+    des.overlap_tracker.record_event(rank, event)
 
 
 def _schedule_inter_comm_at(

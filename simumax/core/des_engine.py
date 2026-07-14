@@ -28,6 +28,7 @@ class ResourceEvent:
     rank: int = 0
     size_bytes: int = 0
     flops: int = 0
+    gid: str = ""     # async P2P group id for send/recv pairing
 
 
 @dataclass
@@ -405,6 +406,58 @@ class MultiResourceDES:
                 rank=r, size_bytes=size_bytes,
             )
             self.overlap_tracker.record_event(r, event)
+
+    # ---- Async P2P support ----
+
+    def schedule_async_send(
+        self,
+        rank: int,
+        gid: str,
+        duration: float,
+        op_name: str = "async_send",
+        module_path: str = "",
+        stage: str = "",
+        size_bytes: int = 0,
+    ):
+        """Schedule an async send on rank's INTER_LINK.  Does NOT block COMPUTE."""
+        q = self.get_queue(rank, ResourceType.INTER_LINK)
+        event = q.schedule(
+            duration, op_name, module_path, stage,
+            rank=rank, size_bytes=size_bytes,
+        )
+        self.overlap_tracker.record_event(rank, event)
+        return event
+
+    def schedule_async_recv(
+        self,
+        rank: int,
+        gid: str,
+        duration: float,
+        op_name: str = "async_recv",
+        module_path: str = "",
+        stage: str = "",
+        size_bytes: int = 0,
+    ):
+        """Schedule an async recv on rank's INTER_LINK.  Does NOT block COMPUTE."""
+        q = self.get_queue(rank, ResourceType.INTER_LINK)
+        event = q.schedule(
+            duration, op_name, module_path, stage,
+            rank=rank, size_bytes=size_bytes,
+        )
+        self.overlap_tracker.record_event(rank, event)
+        return event
+
+    def schedule_async_wait(
+        self,
+        rank: int,
+        gid: str,
+        target_ms: float,
+    ):
+        """Block rank's COMPUTE lane until *target_ms* (when async P2P completes)."""
+        comp_q = self.get_queue(rank, ResourceType.COMPUTE)
+        comp_q.advance_to(target_ms)
+
+    # ---- sync / utility ----
 
     def sync_rank_lanes(self, rank: int):
         res = self.rank_resources[rank]
