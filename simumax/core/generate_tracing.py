@@ -2,6 +2,8 @@ import json
 import re
 import heapq
 
+from simumax.core.simu_events import event_to_record
+
 
 COMM_PREFIXES = (
     "send_",
@@ -505,6 +507,15 @@ def process_log_file(log_path, output_json_path):
         json.dump(tracing_events, json_file, indent=4)
 
     print(f"Processed {len(parsed_logs)} logs. Saved to {output_json_path}.")
+
+
+def write_trace_file(events, output_json_path):
+    """Convert a list of SimuEvent objects to Chrome trace JSON."""
+    records = [event_to_record(event) for event in events]
+    tracing_events = convert_to_tracing_format(records)
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(tracing_events, f, indent=4)
+    print(f"Processed {len(records)} logs. Saved to {output_json_path}.")
 
 
 if __name__ == "__main__":

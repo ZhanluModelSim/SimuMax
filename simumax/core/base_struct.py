@@ -27,6 +27,7 @@ from simumax.core.model_struct import (
     PathDebugContext,
     RecomputeStatus,
 )
+from simumax.core.simu_events import EventSink
 from simumax.core.simu_memory import OpMemoryProfile
 from simumax.core.utils import get_point_name, to_json_string
 from simumax.core.utils import get_rank_group
@@ -81,9 +82,7 @@ class FwdQue:
                     phase=self.phase,
                 )
                 self._mem_finished = True
-            info = f"{self.call_stk} {self.phase} cost {t['comp']-self.st:.6f} st {self.st:.6f} ed {t['comp']:.6f}"
-            with open(ctx.log_path, 'a') as f:
-                f.write(info+'\n')
+            ctx.event_sink.emit_span(self.call_stk, self.phase, self.st, t['comp'])
             return True, None
         return False, blk
 
@@ -173,9 +172,7 @@ class BwdStk:
                     phase="bwd",
                 )
                 self._mem_finished = True
-            info = f"{self.call_stk} bwd cost {t['comp']-self.st_bwd:.6f} st {self.st_bwd:.6f} ed {t['comp']:.6f}"
-            with open(ctx.log_path, 'a') as f:
-                f.write(info+'\n')
+            ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'])
             return True, None
         return False, blk
 
@@ -1556,6 +1553,7 @@ class SimuContext:
         self.merge_lanes = merge_lanes
         self.sync_lanes = sync_lanes
         self.log_path = log_path
+        self.event_sink = EventSink()
         self.current_rank = None
         self.memory_tracker = None
 
@@ -1977,23 +1975,23 @@ class SimuContext:
             recv_post = state.recv_post_t if state.recv_post_t is not None else recv_entry.launch_t
             send_order = state.send_post_order if state.send_post_order is not None else -1
             recv_order = state.recv_post_order if state.recv_post_order is not None else -1
-            send_line = (
-                f"{send_meta['call_stk']} gid {send_meta['id']} {gid[0]} cost {send_entry.end_t-send_entry.launch_t:.6f} "
-                f"st {send_entry.launch_t:.6f} ed {send_entry.end_t:.6f} post {send_post:.6f} order {send_order}"
+            self.event_sink.emit_span(
+                send_meta['call_stk'], gid[0], send_entry.launch_t, send_entry.end_t,
+                gid=send_meta['id'], post=send_post, order=send_order,
+                stream=send_entry.stream,
             )
-            recv_line = (
-                f"{recv_meta['call_stk']} gid {recv_meta['id']} {gid[0]} cost {recv_entry.end_t-recv_entry.launch_t:.6f} "
-                f"st {recv_entry.launch_t:.6f} ed {recv_entry.end_t:.6f} post {recv_post:.6f} order {recv_order}"
+            self.event_sink.emit_span(
+                recv_meta['call_stk'], gid[0], recv_entry.launch_t, recv_entry.end_t,
+                gid=recv_meta['id'], post=recv_post, order=recv_order,
+                stream=recv_entry.stream,
             )
-            with open(self.log_path, "a") as f:
-                f.write(send_line + "\n")
-                f.write(recv_line + "\n")
-                if ready_t > recv_entry.end_t + 1e-9:
-                    wait_call_stk = recv_meta["call_stk"].replace("-async_recv", "-async_wait_recv")
-                    f.write(
-                        f"{wait_call_stk} gid {recv_meta['id']} {gid[0]} cost {ready_t-recv_entry.end_t:.6f} "
-                        f"st {recv_entry.end_t:.6f} ed {ready_t:.6f} post {recv_post:.6f} order {recv_order}\n"
-                    )
+            if ready_t > recv_entry.end_t + 1e-9:
+                wait_call_stk = recv_meta["call_stk"].replace("-async_recv", "-async_wait_recv")
+                self.event_sink.emit_span(
+                    wait_call_stk, gid[0], recv_entry.end_t, ready_t,
+                    gid=recv_meta['id'], post=recv_post, order=recv_order,
+                    stream="comp",
+                )
         state.pair_logged = True
         return ready_t
 
@@ -2028,9 +2026,7 @@ class LeafModel():
         if ok:
             if t['comp'] == self.st:
                 return True, None
-            info = f"{self.call_stk} {self.forward_op} cost {t['comp']-self.st:.6f} st {self.st:.6f} ed {t['comp']:.6f}"
-            with open(ctx.log_path, 'a') as f:
-                f.write(info+'\n')
+            ctx.event_sink.emit_span(self.call_stk, self.forward_op, self.st, t['comp'])
             return True, None
         return False, blk
     
@@ -2046,9 +2042,7 @@ class LeafModel():
         if ok:
             if t['comp'] == self.st_bwd:
                 return True, None
-            info = f"{self.call_stk} bwd cost {t['comp']-self.st_bwd:.6f} st {self.st_bwd:.6f} ed {t['comp']:.6f}"
-            with open(ctx.log_path, 'a') as f:
-                f.write(info+'\n')
+            ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'])
             return True, None
         return False, blk
     
@@ -2142,12 +2136,10 @@ class Com(LeafModel):
             done_t = self._fwd_done_t if self._fwd_done_t is not None else t[self.stream]
             if self._fwd_launch_st is None or done_t == self._fwd_launch_st:
                 return True, None
-            info = (
-                f"{self.call_stk} gid {self.id} fwd cost {done_t-self._fwd_launch_st:.6f} "
-                f"st {self._fwd_launch_st:.6f} ed {done_t:.6f}"
+            ctx.event_sink.emit_span(
+                self.call_stk, "fwd", self._fwd_launch_st, done_t,
+                gid=self.id, stream=self.stream,
             )
-            with open(ctx.log_path, "a") as f:
-                f.write(info + "\n")
             self._fwd_launch_st = None
             self._fwd_done_t = None
             return True, None
@@ -2160,12 +2152,10 @@ class Com(LeafModel):
             done_t = self._bwd_done_t if self._bwd_done_t is not None else t[self.stream]
             if self._bwd_launch_st is None or done_t == self._bwd_launch_st:
                 return True, None
-            info = (
-                f"{self.call_stk} gid {self.id} bwd cost {done_t-self._bwd_launch_st:.6f} "
-                f"st {self._bwd_launch_st:.6f} ed {done_t:.6f}"
+            ctx.event_sink.emit_span(
+                self.call_stk, "bwd", self._bwd_launch_st, done_t,
+                gid=self.id, stream=self.stream,
             )
-            with open(ctx.log_path, "a") as f:
-                f.write(info + "\n")
             self._bwd_launch_st = None
             self._bwd_done_t = None
             return True, None

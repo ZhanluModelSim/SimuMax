@@ -8,7 +8,8 @@ import pickle
 from types import SimpleNamespace
 
 from simumax.core.base_struct import BarrierBackend, SimuContext, SimuSystem, SimuThread
-from simumax.core.generate_tracing import process_log_file
+from simumax.core.generate_tracing import write_trace_file
+from simumax.core.simu_events import write_debug_log
 from simumax.core.simu_artifacts import (
     append_memory_events_to_trace,
     export_simu_memory_artifacts,
@@ -28,8 +29,6 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     os.makedirs(save_path, exist_ok=True)
     log_path = os.path.join(save_path, "log.log")
     output_json_path = os.path.join(save_path, "tracing_logs.json")
-    if os.path.exists(log_path):
-        os.remove(log_path)
     ctx = SimuContext(BarrierBackend(), merge_lanes=merge_lanes, log_path=log_path)
     if should_enable_simu_memory_timeline(perf_model.strategy, perf_model._vp_size()):
         ctx.memory_tracker = SimuMemoryTracker()
@@ -88,7 +87,8 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
 
     print("wall time", time.time() - t0)
 
-    process_log_file(log_path, output_json_path)
+    write_debug_log(ctx.event_sink.events, log_path)
+    write_trace_file(ctx.event_sink.events, output_json_path)
     if ctx.memory_tracker is not None:
         append_memory_events_to_trace(output_json_path, ctx.memory_tracker)
         export_simu_memory_artifacts(save_path, ctx.memory_tracker, pickle_module=pickle)
