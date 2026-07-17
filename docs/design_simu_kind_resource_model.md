@@ -6,7 +6,7 @@
 # Design Proposal: Explicit `simu_kind` and Resource/Engine Lane Model
 
 - Status: **v1.0 (Phases 0-3 implemented)**
-- Implementation: phase 0 `0e83888`, phase 1 `3229d92`, phase 2 `79e4dfd`, phase 3 `TBD` (this change).
+- Implementation: phase 0 `0e83888`, phase 1 `3229d92`, phase 2 `79e4dfd`, phase 3 `602c209`.
 - Date: 2026-07-17
 - Scope: `simumax/core` DES path (`PerfLLM.simulate()`), trace export, configs.
   The static analytical path (`analysis_*`) is explicitly out of scope for now.

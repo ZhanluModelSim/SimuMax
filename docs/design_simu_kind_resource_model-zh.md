@@ -6,7 +6,7 @@
 # 设计方案：显式 `simu_kind` 与资源/引擎 lane 模型
 
 - 状态：**v1.0（Phase 0-3 已实现）**
-- 实现记录：phase 0 `0e83888`，phase 1 `3229d92`，phase 2 `79e4dfd`，phase 3 `TBD`（本次变更）。
+- 实现记录：phase 0 `0e83888`，phase 1 `3229d92`，phase 2 `79e4dfd`，phase 3 `602c209`。
 - 日期：2026-07-17
 - 范围：`simumax/core` 的 DES 路径（`PerfLLM.simulate()`）、trace 导出、配置。
   静态解析路径（`analysis_*`）明确不在本期范围内。
