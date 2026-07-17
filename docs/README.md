@@ -63,3 +63,10 @@ Recommended order:
 - [docs/b200/README.md](./b200/README.md)
 - [B200 formal summary](./b200/b200_release_v1.2_summary.md)
 - [B200 real reproduction guide](./b200/b200_real_repro_guide.md)
+
+## Design Proposals
+
+- [design_simu_kind_resource_model.md](./design_simu_kind_resource_model.md)
+  ([中文版本](./design_simu_kind_resource_model-zh.md)) — explicit
+  `simu_kind` operator classification, resource/engine lane model, and
+  extensible fused-op support for the `simulate()` DES path.
