@@ -24,12 +24,16 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     """Run simulator replay for a configured PerfLLM-like object."""
 
     model_base = perf_model.model_chunk_dict["first_stage_chunk"]
-    simu = SimuSystem()
+    # Resource lanes are computed once from the system config (design doc 4.2)
+    # and shared by the SimuSystem, every SimuThread lane dict, and the ctx.
+    resource_lanes = perf_model.system.simu_resource_lanes()
+    simu = SimuSystem(resource_lanes=resource_lanes)
     t0 = time.time()
     os.makedirs(save_path, exist_ok=True)
     log_path = os.path.join(save_path, "log.log")
     output_json_path = os.path.join(save_path, "tracing_logs.json")
-    ctx = SimuContext(BarrierBackend(), merge_lanes=merge_lanes, log_path=log_path)
+    ctx = SimuContext(BarrierBackend(), merge_lanes=merge_lanes, log_path=log_path,
+                      resource_lanes=resource_lanes)
     if should_enable_simu_memory_timeline(perf_model.strategy, perf_model._vp_size()):
         ctx.memory_tracker = SimuMemoryTracker()
 
@@ -44,7 +48,7 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
             if merge_lanes
             else rank_i
         )
-        thread = SimuThread(rank=rank)
+        thread = SimuThread(rank=rank, lanes=resource_lanes)
 
         args = SimpleNamespace(thread_state=thread.thread_state, rank=rank, microbatch=0)
         rank_info = get_rank_group(rank, model_base.strategy)

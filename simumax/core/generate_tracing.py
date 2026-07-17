@@ -39,6 +39,19 @@ def _rank_sort_key(pid):
     return int(match.group(1)) if match else 0
 
 
+def _is_post_marker_name(base_name):
+    """Detect zero-duration post markers by their display-name suffix.
+
+    Phase 2 (design doc 9.3): every blocking comm op emits an extra
+    zero-duration marker at its issue time, displayed as the completion
+    span's name plus "-post" and sharing the completion's comm gid. The
+    pairing logic below assumes exactly 1 send + 1 recv per gid, so markers
+    must be excluded from pairability detection and flow generation. They
+    still render as normal zero-duration comm slices on their lane.
+    """
+    return str(base_name).endswith("-post")
+
+
 def _ordered_tid(tid):
     if str(tid).startswith("pp_detail_"):
         return f"07_{tid}"
@@ -200,7 +213,11 @@ def convert_to_tracing_format(parsed_logs):
         call_stack = log.get("call_stack", [])
         if not call_stack:
             continue
-        base = call_stack[-1]
+        base = log.get("name") or call_stack[-1]
+        if _is_post_marker_name(base):
+            # Post markers share the gid with their completion span; they are
+            # not real send/recv events and must not affect pairability.
+            continue
         st = pairable_gid.setdefault(gid, {"send": False, "recv": False})
         if base.startswith(("send_", "async_send", "sync_send")):
             st["send"] = True
@@ -218,7 +235,7 @@ def convert_to_tracing_format(parsed_logs):
         # Simulator timestamps are in milliseconds; Chrome tracing uses microseconds.
         st = log["st"] * 1e3
         ed = log["ed"] * 1e3
-        base_name = call_stack[-1]
+        base_name = log.get("name") or call_stack[-1]
         gid = log.get("gid")
 
         # Phase 1: display classification comes from the explicit SimuEvent
@@ -377,12 +394,16 @@ def convert_to_tracing_format(parsed_logs):
 
     flow_id = 0
     for gid, events in by_gid.items():
+        # Post markers ("-post" suffix) share the gid with their completion
+        # span; exclude them so the exactly-1-send + 1-recv check below only
+        # counts real comm events.
         sends = [
             event
             for event in events
             if event.get("args", {}).get("base_name", "").startswith(
                 ("send_", "async_send", "sync_send")
             )
+            and not _is_post_marker_name(event.get("args", {}).get("base_name", ""))
         ]
         recvs = [
             event
@@ -390,6 +411,7 @@ def convert_to_tracing_format(parsed_logs):
             if event.get("args", {}).get("base_name", "").startswith(
                 ("recv_", "async_recv", "sync_recv")
             )
+            and not _is_post_marker_name(event.get("args", {}).get("base_name", ""))
         ]
         if len(sends) != 1 or len(recvs) != 1:
             continue

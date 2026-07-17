@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from abc import ABC
 from typing import ClassVar, List, Tuple, Dict
-from collections import defaultdict, deque
+from collections import deque
 import heapq
 import time
 import types
@@ -56,7 +56,8 @@ class FwdQue:
         self._span_lane = None
 
     def step(self, t, ctx):
-        # t is dict: {"comp","comm","off"}
+        # t is the per-rank lane-clock dict (lanes from the resource registry,
+        # see SimuThread); FwdQue advances the "comp" lane.
         if self.st is None:
             self.st = t["comp"]
             # A queue wrapping exactly one op inherits that op's span
@@ -1359,13 +1360,22 @@ class AsyncP2PState:
 
 class State_Thread:
     def __init__(self):
-        self.comm_order = 0    
-    
+        self.comm_order = 0
+
+
+# Built-in resource lanes used when no system-level registry is supplied
+# (design doc 4.2). Must match SystemConfig.simu_resource_lanes()'s built-ins;
+# the legacy "off" lane is dropped.
+DEFAULT_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd")
+
+
 class SimuThread:
-    def __init__(self, rank=None):
+    def __init__(self, rank=None, lanes=None):
         self.rank = rank  # Exposed so SimuSystem can manage per-rank scheduling.
         self.job = []
-        self.t = defaultdict(float, {"comp": 0.0, "comm": 0.0, "off": 0.0})
+        if lanes is None:
+            lanes = DEFAULT_RESOURCE_LANES
+        self.t = {lane: 0.0 for lane in lanes}
         self.thread_state = State_Thread()
 
     def _sync_time(self):
@@ -1404,8 +1414,11 @@ class SimuThread:
 
 
 class SimuSystem:
-    def __init__(self):
+    def __init__(self, resource_lanes=None):
         self.threads = []  # thread must have .rank and .step()
+        # Lane names from the system resource registry (design doc 4.2);
+        # informational here — each SimuThread already carries its lane dict.
+        self.resource_lanes = list(resource_lanes) if resource_lanes is not None else None
 
     def simu(self, ctx):
         # ctx.backend: BarrierBackend
@@ -1422,7 +1435,11 @@ class SimuSystem:
             if ctx.sync_lanes:
                 return max(th.t.values()) if th.t else 0.0
             # Overlap mode: schedule rank as soon as one lane can make progress.
-            active = [t for lane, t in th.t.items() if lane != "off"]
+            # Replicate the legacy defaultdict semantics: comp/comm always
+            # count; other lanes count once they have been touched (> 0),
+            # so untouched pp lanes do not distort heap priorities.
+            active = [v for lane, v in th.t.items()
+                      if v > 0 or lane in ("comp", "comm")]
             return min(active) if active else 0.0
 
         def push(r):
@@ -1559,7 +1576,8 @@ class SimuSystem:
         return end_t
 
 class SimuContext:
-    def __init__(self, backend, merge_lanes=True, log_path='./tmp/log.log', sync_lanes=False):
+    def __init__(self, backend, merge_lanes=True, log_path='./tmp/log.log', sync_lanes=False,
+                 resource_lanes=None):
         self.backend = backend
         self.p2p_backend = P2PBackend()
         self.pending_completions = []  # list[(waiters, end_t, stream)]
@@ -1580,6 +1598,9 @@ class SimuContext:
         self.event_sink = EventSink()
         self.current_rank = None
         self.memory_tracker = None
+        # Resource-lane names shared by all threads (design doc 4.2); kept on
+        # the context so comm code can resolve lane membership if needed.
+        self.resource_lanes = resource_lanes
 
 
     @staticmethod
@@ -2047,7 +2068,8 @@ class LeafModel():
     #     return out if isinstance(out, tuple) else (bool(out), None)
     
     def step(self, t, ctx):
-        # t is dict: {"comp","comm","off"}
+        # t is the per-rank lane-clock dict (lanes from the resource registry,
+        # see SimuThread); leaf ops advance the "comp" lane.
         if self.st is None:
             self.st = t["comp"]
 
@@ -2163,6 +2185,19 @@ class Com(LeafModel):
             return entry.issue_t
         return entry.launch_t
 
+    def _emit_post_marker(self, ctx, phase, issue_t):
+        # Faithful post/wait trace shape for blocking comm (design doc 9.3):
+        # a zero-duration marker at the moment the op posts (CommEntry issued
+        # / barrier reached). The completion span is still emitted by the
+        # step/bwd wrappers; this marker carries no timing effect. The display
+        # name is the completion span's name (last call_stk segment) + "-post".
+        ctx.event_sink.emit_span(
+            self.call_stk, phase, issue_t, issue_t,
+            gid=self.id, stream=self.stream,
+            kind="comm", lane=self.simu_lane,
+            name=self.call_stk.split("-")[-1] + "-post",
+        )
+
     def step(self, t, ctx):
         out = self._step(t, ctx)
         ok, blk = out if isinstance(out, tuple) else (bool(out), None)
@@ -2231,6 +2266,9 @@ class Com(LeafModel):
                 log_call_stk=self.call_stk,
                 log_id=self.id,
             )
+            # Faithful post marker (design doc 9.3): the post happens at issue;
+            # the completion span follows from the step wrapper as before.
+            self._emit_post_marker(ctx, "fwd", t["comp"])
             ctx.pump_comm_queue()
         if not ctx.entry_done(self._fwd_entry_eid):
             return False, ("comm_entry", self._fwd_entry_eid)
@@ -2274,6 +2312,9 @@ class Com(LeafModel):
                 log_call_stk=self.call_stk,
                 log_id=self.id,
             )
+            # Faithful post marker (design doc 9.3): the post happens at issue;
+            # the completion span follows from the bwd wrapper as before.
+            self._emit_post_marker(ctx, "bwd", t["comp"])
             ctx.pump_comm_queue()
         if not ctx.entry_done(self._bwd_entry_eid):
             return False, ("comm_entry", self._bwd_entry_eid)
@@ -2298,7 +2339,12 @@ class Com(LeafModel):
         m = max(t["comp"], t["comm"])
         t["comp"] = t["comm"] = m
         ready_t = self._batch_submit_by_gid.get(gid, t[self.stream])
+        first_arrival = gid not in self._blocking_start_by_gid
         done, waiters, end_t = ctx.backend.arrive(gid, self.global_rank, ready_t, 2, cost)
+        if first_arrival:
+            # Faithful post marker (design doc 9.3): the post happens at the
+            # first barrier arrival, whether the op blocks or completes now.
+            self._emit_post_marker(ctx, phase, ready_t)
         if not done:
             self._blocking_start_by_gid.setdefault(gid, ready_t)
             return False, ("barrier", gid)

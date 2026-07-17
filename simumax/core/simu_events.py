@@ -52,8 +52,12 @@ class EventSink:
         self.dropped = 0
 
     def emit_span(self, call_stk, operation, st, ed, gid=None, post=None,
-                  order=None, stream="comp", kind=None, lane=None):
-        """Append one span. ``call_stk`` keeps the legacy 'rankN-...' form."""
+                  order=None, stream="comp", kind=None, lane=None, name=None):
+        """Append one span. ``call_stk`` keeps the legacy 'rankN-...' form.
+
+        ``name`` overrides the display name (default: last call-stack
+        segment) without changing the call-stack segments.
+        """
         match = _RANK_PREFIX.match(call_stk)
         if not match:
             self.dropped += 1
@@ -61,7 +65,7 @@ class EventSink:
         segments = call_stk[match.end():].split("-")
         self.events.append(SimuEvent(
             rank=int(match.group(1)),
-            name=segments[-1],
+            name=name or segments[-1],
             call_stack=segments,
             operation=operation,
             cost=ed - st,
@@ -84,6 +88,7 @@ def event_to_record(event: SimuEvent) -> dict:
     """
     return {
         "rank": f"rank{event.rank}",
+        "name": event.name,
         "call_stack": list(event.call_stack),
         "gid": event.gid,
         "operation": event.operation,

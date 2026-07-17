@@ -755,6 +755,10 @@ class SystemConfig(Config):
     intra_with_pcie: bool = False
     miss_efficiency: dict = field(default_factory=OrderedDict)
     hit_efficiency: dict = field(default_factory=OrderedDict)
+    # Extra hardware engine lanes (design doc 4.2), e.g.
+    # {"cube": {"peak_tflops": 320}, "vector": {"peak_tflops": 80}}.
+    # None means single-engine, which reproduces the current behavior.
+    engines: Optional[Dict[str, dict]] = None
 
     @classmethod
     def init_from_dict(cls, config_dict: Dict[str, Any]):
@@ -780,6 +784,7 @@ class SystemConfig(Config):
             for net_name, network in networks.items()
         }
         FC8 = config_dict.pop("FC8", False)
+        engines = config_dict.pop("engines", None)
         return cls(
             sys_name=sys_name,
             num_per_node=num_per_node,
@@ -787,6 +792,7 @@ class SystemConfig(Config):
             networks=networks,
             FC8=FC8,
             intra_with_pcie = intra_with_pcie,
+            engines=engines,
         )
     
     def record_miss_efficiency(self, op_name:str, flops:int, shape_desc:str, use_eff):
@@ -1034,8 +1040,44 @@ class SystemConfig(Config):
 
         return total_time
 
+    # Resource lanes that never collide with user-declared engine names
+    # ("off" is the idle lane of SimuThread's lane clock, see design doc 4.2).
+    RESERVED_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd", "off")
+
+    def simu_resource_lanes(self) -> list[str]:
+        """Pinned resource-lane contract for the simulator (design doc 4.2).
+
+        Returns the built-in lanes ["comp", "comm", "pp_fwd", "pp_bwd"] plus
+        the sorted names of `engines` entries not already in that list.
+        """
+        lanes = ["comp", "comm", "pp_fwd", "pp_bwd"]
+        if self.engines:
+            lanes.extend(sorted(name for name in self.engines if name not in lanes))
+        return lanes
+
     def sanity_check(self):
-        pass
+        if self.engines is None:
+            return
+        assert isinstance(self.engines, dict), (
+            f"engines must be a dict of name -> dict, but got {type(self.engines)}"
+        )
+        reserved_lanes = set(self.RESERVED_RESOURCE_LANES)
+        for name, engine in self.engines.items():
+            assert isinstance(name, str) and name.isidentifier(), (
+                f"engine name {name!r} must be a non-empty identifier"
+            )
+            assert name not in reserved_lanes, (
+                f"engine name {name!r} collides with reserved resource lane, "
+                f"reserved lanes are {sorted(reserved_lanes)}"
+            )
+            assert isinstance(engine, dict), (
+                f"engines[{name!r}] must be a dict, but got {type(engine)}"
+            )
+            peak_tflops = engine.get("peak_tflops")
+            if peak_tflops is not None:
+                assert isinstance(peak_tflops, (int, float)) and not isinstance(peak_tflops, bool), (
+                    f"engines[{name!r}]['peak_tflops'] must be numeric, but got {peak_tflops!r}"
+                )
 
 
 @dataclass
