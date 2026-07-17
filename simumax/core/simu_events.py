@@ -92,6 +92,9 @@ def event_to_record(event: SimuEvent) -> dict:
         "ed": round(event.ed, 6),
         "post": round(event.post, 6) if event.post is not None else None,
         "order": event.order,
+        "stream": event.stream,
+        "kind": event.kind,
+        "lane": event.lane,
     }
 
 

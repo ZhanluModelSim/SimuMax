@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
 from abc import ABC
-from typing import List, Tuple, Dict
+from typing import ClassVar, List, Tuple, Dict
 from collections import defaultdict, deque
 import heapq
 import time
@@ -50,11 +50,23 @@ class FwdQue:
         self._mem_started = False
         self._mem_finished = False
         self.batch_blocking_comm = batch_blocking_comm
+        # Phase-line classification latched from a single contained op on the
+        # first step; None/None keeps the exporter's structural fallback.
+        self._span_kind = None
+        self._span_lane = None
 
     def step(self, t, ctx):
         # t is dict: {"comp","comm","off"}
         if self.st is None:
             self.st = t["comp"]
+            # A queue wrapping exactly one op inherits that op's span
+            # classification (e.g. a lone comm op); multi-op queues keep
+            # None/None so the exporter applies its structural fallback.
+            # batch_blocking_comm queues (batch_pp_*) always keep None/None:
+            # the exporter's batch_pp name rule classifies them as scope.
+            if not self.batch_blocking_comm and len(self.que) == 1:
+                self._span_kind = getattr(self.que[0], "simu_kind", None)
+                self._span_lane = getattr(self.que[0], "simu_lane", None)
         if (
             self.mem_profile is not None
             and not self._mem_started
@@ -82,7 +94,8 @@ class FwdQue:
                     phase=self.phase,
                 )
                 self._mem_finished = True
-            ctx.event_sink.emit_span(self.call_stk, self.phase, self.st, t['comp'])
+            ctx.event_sink.emit_span(self.call_stk, self.phase, self.st, t['comp'],
+                                     kind=self._span_kind, lane=self._span_lane)
             return True, None
         return False, blk
 
@@ -141,10 +154,20 @@ class BwdStk:
         self.mem_profile = mem_profile
         self._mem_started = False
         self._mem_finished = False
+        # Phase-line classification latched from a single contained op on the
+        # first bwd; None/None keeps the exporter's structural fallback.
+        self._span_kind = None
+        self._span_lane = None
 
     def bwd(self, t, ctx):
         if self.st_bwd is None:
             self.st_bwd = t["comp"]
+            # A stack wrapping exactly one op inherits that op's span
+            # classification (e.g. a lone comm op); multi-op stacks keep
+            # None/None so the exporter applies its structural fallback.
+            if len(self.stk) == 1:
+                self._span_kind = getattr(self.stk[0], "simu_kind", None)
+                self._span_lane = getattr(self.stk[0], "simu_lane", None)
         if (
             self.mem_profile is not None
             and not self._mem_started
@@ -172,7 +195,8 @@ class BwdStk:
                     phase="bwd",
                 )
                 self._mem_finished = True
-            ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'])
+            ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'],
+                                     kind=self._span_kind, lane=self._span_lane)
             return True, None
         return False, blk
 
@@ -1978,19 +2002,19 @@ class SimuContext:
             self.event_sink.emit_span(
                 send_meta['call_stk'], gid[0], send_entry.launch_t, send_entry.end_t,
                 gid=send_meta['id'], post=send_post, order=send_order,
-                stream=send_entry.stream,
+                stream=send_entry.stream, kind="comm", lane=None,
             )
             self.event_sink.emit_span(
                 recv_meta['call_stk'], gid[0], recv_entry.launch_t, recv_entry.end_t,
                 gid=recv_meta['id'], post=recv_post, order=recv_order,
-                stream=recv_entry.stream,
+                stream=recv_entry.stream, kind="comm", lane=None,
             )
             if ready_t > recv_entry.end_t + 1e-9:
                 wait_call_stk = recv_meta["call_stk"].replace("-async_recv", "-async_wait_recv")
                 self.event_sink.emit_span(
                     wait_call_stk, gid[0], recv_entry.end_t, ready_t,
                     gid=recv_meta['id'], post=recv_post, order=recv_order,
-                    stream="comp",
+                    stream="comp", kind="wait", lane=None,
                 )
         state.pair_logged = True
         return ready_t
@@ -2003,6 +2027,12 @@ class SimuContext:
 
 
 class LeafModel():
+    # Phase-1 span classification for the trace exporter (see
+    # docs/design_simu_kind_resource_model.md section 4.1). Pure annotation:
+    # scheduling, lanes, and durations are unaffected.
+    simu_kind: ClassVar[str | None] = "compute"
+    simu_lane: ClassVar[str | None] = None
+
     def __init__(self, specific_name=''):
         self.st = None
         self.st_bwd = None
@@ -2026,7 +2056,8 @@ class LeafModel():
         if ok:
             if t['comp'] == self.st:
                 return True, None
-            ctx.event_sink.emit_span(self.call_stk, self.forward_op, self.st, t['comp'])
+            ctx.event_sink.emit_span(self.call_stk, self.forward_op, self.st, t['comp'],
+                                     kind=self.simu_kind, lane=self.simu_lane)
             return True, None
         return False, blk
     
@@ -2042,7 +2073,8 @@ class LeafModel():
         if ok:
             if t['comp'] == self.st_bwd:
                 return True, None
-            ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'])
+            ctx.event_sink.emit_span(self.call_stk, "bwd", self.st_bwd, t['comp'],
+                                     kind=self.simu_kind, lane=self.simu_lane)
             return True, None
         return False, blk
     
@@ -2095,6 +2127,8 @@ class AtomModel(LeafModel):
         return clone
     
 class Com(LeafModel):
+    simu_kind = "comm"
+
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0,
                  call_stk='', global_rank=None, stream="comm"):
         super().__init__()
@@ -2139,6 +2173,7 @@ class Com(LeafModel):
             ctx.event_sink.emit_span(
                 self.call_stk, "fwd", self._fwd_launch_st, done_t,
                 gid=self.id, stream=self.stream,
+                kind=self.simu_kind, lane=self.simu_lane,
             )
             self._fwd_launch_st = None
             self._fwd_done_t = None
@@ -2155,6 +2190,7 @@ class Com(LeafModel):
             ctx.event_sink.emit_span(
                 self.call_stk, "bwd", self._bwd_launch_st, done_t,
                 gid=self.id, stream=self.stream,
+                kind=self.simu_kind, lane=self.simu_lane,
             )
             self._bwd_launch_st = None
             self._bwd_done_t = None
@@ -2347,6 +2383,8 @@ class all2all_bwd(Com):
         return True
 
 class send(Com):
+    simu_lane = "pp_detail"
+
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0, call_stk='', **kwargs):
         assert (rank==0 and group_size==2)
         super().__init__(id, rank, group_size, com_buff, 
@@ -2359,6 +2397,8 @@ class send(Com):
         return self._blocking_step_impl(t, ctx, phase="bwd")
 
 class recv(Com):
+    simu_lane = "pp_detail"
+
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0, call_stk='', **kwargs):
         assert (rank==1 and group_size==2)
         super().__init__(id, rank, group_size, com_buff, 
@@ -2407,6 +2447,8 @@ class send_prev(send):
 
 
 class async_send(LeafModel):
+    simu_kind = "comm"
+
     def __init__(self, id, fwd_cost=0, call_stk='', global_rank=None, stream="comm"):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
@@ -2449,6 +2491,8 @@ class async_send(LeafModel):
 
 
 class async_recv(LeafModel):
+    simu_kind = "comm"
+
     def __init__(self, id, call_stk='', global_rank=None, stream="comm", fwd_cost=0):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
@@ -2529,6 +2573,11 @@ class async_send_prev(async_send):
             self.step = lambda *args: True
 
 class async_wait_recv(LeafModel):
+    # This op never emits its own span: the visible wait line is produced by
+    # SimuContext.emit_async_pair_logs with kind="wait". The ClassVar only
+    # declares the op's semantics (design doc 4.1: async_wait_recv -> wait).
+    simu_kind = "wait"
+
     def __init__(self, id, call_stk='', global_rank=None, stream="comm", fwd_cost=0):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
@@ -2628,6 +2677,8 @@ class async_wait_recv_next(async_wait_recv):
 
 
 class sync_send(async_send):
+    simu_kind = "comm"
+
     def _step(self, t, ctx, phase="fwd"):
         if self.global_rank is None:
             raise RuntimeError(f"sync_send {self.id}: global_rank is None")
@@ -2668,6 +2719,10 @@ class sync_send_prev(async_send_prev):
 
 
 class sync_wait_recv(async_wait_recv):
+    # Overrides async_wait_recv's "wait": sync_wait_recv runs on stream "comm"
+    # and its visible span is the recv line classified as comm (legacy mapping).
+    simu_kind = "comm"
+
     def _step(self, t, ctx, phase="fwd"):
         if self.global_rank is None:
             raise RuntimeError(f"sync_wait_recv {self.id}: global_rank is None")

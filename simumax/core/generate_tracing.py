@@ -5,27 +5,6 @@ import heapq
 from simumax.core.simu_events import event_to_record
 
 
-COMM_PREFIXES = (
-    "send_",
-    "recv_",
-    "all_reduce",
-    "all_gather",
-    "reduce_scatter",
-    "all2all",
-    "broadcast",
-    "scatter",
-    "gather",
-    "reduce",
-    "async_send",
-    "async_recv",
-    "async_wait_send",
-    "async_wait_recv",
-    "sync_send",
-    "sync_recv",
-    "sync_wait_recv",
-)
-
-
 def parse_log_line(line):
     """Parse one simulator log line."""
     log_pattern = re.compile(
@@ -53,10 +32,6 @@ def parse_log_line(line):
         "post": float(match.group("post")) if match.group("post") is not None else None,
         "order": int(match.group("order")) if match.group("order") is not None else None,
     }
-
-
-def _is_comm_event(event_name):
-    return event_name.startswith(COMM_PREFIXES)
 
 
 def _rank_sort_key(pid):
@@ -109,16 +84,6 @@ def _thread_sort_index(tid):
     return order.get(tid, 100)
 
 
-def _comm_lane(base_name):
-    if base_name.startswith(("send_", "recv_")):
-        return "pp_detail"
-    if base_name.startswith(("async_send_next", "async_recv_prev", "async_wait_recv_prev")):
-        return "pp_fwd"
-    if base_name.startswith(("async_send_prev", "async_recv_next", "async_wait_recv_next")):
-        return "pp_bwd"
-    return "comm"
-
-
 def _flow_anchor_ts(event, prefer_end=False):
     """Anchor flow markers inside the slice to avoid boundary collisions."""
     ts = float(event["ts"])
@@ -151,12 +116,77 @@ def _pp_display_pad_ts(event):
     return min(5e-4, dur * 0.1)
 
 
+def _apply_scope_recategorization(event):
+    """Move one inclusive parent/container event onto its scope lane."""
+    args = event.get("args", {})
+    direction = args.get("direction", "fwd")
+    event["cat"] = "scope"
+    if direction == "recompute_fwd":
+        event["tid"] = "bwd_scope"
+        if args.get("base_name", "") == "recompute_block":
+            event["name"] = "recompute_fwd"
+    else:
+        event["tid"] = f"{direction}_scope"
+
+
+def _recategorize_scope_events(tracing_events):
+    """Split inclusive parent/module envelopes from leaf compute events.
+
+    This keeps real kernels on compute lanes while preserving hierarchy on a
+    dedicated scope lane. Stack-based sweep per pid: compute events are sorted
+    by (ts asc, dur desc) and scanned once while a stack of still-open
+    candidate containers is maintained. An event becomes a scope when a later
+    event's call_stack strictly extends its own while being temporally
+    enclosed, or when it is one of the named recompute containers.
+    """
+    compute_by_pid = {}
+    for event in tracing_events:
+        if event.get("cat") != "compute" or event.get("ph") != "X":
+            continue
+        compute_by_pid.setdefault(event["pid"], []).append(event)
+
+    for _, events in compute_by_pid.items():
+        events.sort(key=lambda event: (event["ts"], -(event["dur"] or 0.0)))
+        # Open containers that may still enclose later events. Each entry is
+        # [end_ts, call_stack, event, already_scope].
+        open_stack = []
+        for event in events:
+            args = event.get("args", {})
+            call_stack = args.get("call_stack", [])
+            if not call_stack:
+                continue
+            start_ts = event["ts"]
+            end = start_ts + (event.get("dur") or 0.0)
+            # Containers closed before this event starts (beyond the inclusive
+            # epsilon) cannot enclose it or any later event.
+            while open_stack and start_ts > open_stack[-1][0] + 1e-9:
+                open_stack.pop()
+            # Every still-open container whose call_stack is a strict prefix of
+            # this event's is an inclusive parent envelope, i.e. a scope.
+            for entry in open_stack:
+                if entry[3]:
+                    continue
+                if len(call_stack) <= len(entry[1]):
+                    continue
+                if call_stack[: len(entry[1])] != entry[1]:
+                    continue
+                if end <= entry[0] + 1e-9:
+                    _apply_scope_recategorization(entry[2])
+                    entry[3] = True
+            is_scope = args.get("base_name", "") in ("recompute_block", "checkpoint_bwd")
+            if is_scope:
+                _apply_scope_recategorization(event)
+            open_stack.append([end, call_stack, event, is_scope])
+
+
 def convert_to_tracing_format(parsed_logs):
     """
     Convert parsed logs to Chrome Tracing events.
-    Stream layout:
-    - fwd_compute / fwd_comm
-    - bwd_compute / bwd_comm
+
+    Records are dicts from parse_log_line (legacy text path) or
+    event_to_record (SimuEvent stream). Classification comes from the
+    explicit record kind/lane/stream annotations; records without them fall
+    back to the structural batch_pp/compute rules.
     """
     tracing_events = []
     event_id_counter = 0
@@ -191,13 +221,21 @@ def convert_to_tracing_format(parsed_logs):
         base_name = call_stack[-1]
         gid = log.get("gid")
 
-        if base_name.startswith("batch_pp"):
+        # Phase 1: display classification comes from the explicit SimuEvent
+        # annotations (kind/lane/stream). Records without a kind (legacy text
+        # log lines, pipeline-schedule exports) keep the structural fallback.
+        kind = log.get("kind")
+        if kind:
+            stream_type = kind
+        elif base_name.startswith("batch_pp"):
             stream_type = "scope"
-        elif base_name.startswith(("async_wait_send", "async_wait_recv")):
-            stream_type = "wait"
         else:
-            stream_type = "comm" if _is_comm_event(base_name) else "compute"
-        lane = _comm_lane(base_name) if stream_type == "comm" else stream_type
+            stream_type = "compute"
+        if stream_type == "comm":
+            stream = log.get("stream") or "comp"
+            lane = log.get("lane") or (stream if stream != "comp" else "comm")
+        else:
+            lane = stream_type
         if stream_type == "wait":
             tid = "wait"
         elif stream_type == "comm":
@@ -322,41 +360,7 @@ def convert_to_tracing_format(parsed_logs):
     # Split inclusive parent/module envelopes from leaf compute events.
     # This keeps real kernels on compute lanes while preserving hierarchy on a
     # dedicated scope lane.
-    compute_by_pid = {}
-    for idx, event in enumerate(tracing_events):
-        if event.get("cat") != "compute" or event.get("ph") != "X":
-            continue
-        compute_by_pid.setdefault(event["pid"], []).append((idx, event))
-
-    for _, items in compute_by_pid.items():
-        items.sort(key=lambda x: (x[1]["ts"], -(x[1]["dur"] or 0.0)))
-        for i, (idx, event) in enumerate(items):
-            parent_stack = event.get("args", {}).get("call_stack", [])
-            if not parent_stack:
-                continue
-            parent_end = event["ts"] + (event.get("dur") or 0.0)
-            base_name = event.get("args", {}).get("base_name", "")
-            is_scope = base_name in ("recompute_block", "checkpoint_bwd")
-            for j in range(i + 1, len(items)):
-                child = items[j][1]
-                child_stack = child.get("args", {}).get("call_stack", [])
-                if len(child_stack) <= len(parent_stack):
-                    continue
-                if child_stack[: len(parent_stack)] != parent_stack:
-                    continue
-                child_end = child["ts"] + (child.get("dur") or 0.0)
-                if child["ts"] >= event["ts"] and child_end <= parent_end + 1e-9:
-                    is_scope = True
-                    break
-            if is_scope:
-                direction = event.get("args", {}).get("direction", "fwd")
-                event["cat"] = "scope"
-                if direction == "recompute_fwd":
-                    event["tid"] = "bwd_scope"
-                    if base_name == "recompute_block":
-                        event["name"] = "recompute_fwd"
-                else:
-                    event["tid"] = f"{direction}_scope"
+    _recategorize_scope_events(tracing_events)
 
     # For PP point-to-point comm, emit one direct flow per pair. In async mode
     # the anchor is nudged inside the slice when post_ts exists; in sync mode
