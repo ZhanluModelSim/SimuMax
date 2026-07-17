@@ -86,6 +86,52 @@ class OptimizerSimulator(MetaModule):
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
 
+class ScheduleBuilder:
+    """Interface for pipeline-schedule job-list builders.
+
+    A builder expands a full batch of microbatches into the sequential job
+    list consumed by the DES thread (see docs/design_simu_kind_resource_model.md
+    section 4.4). Builders are stateless; all schedule state stays on the
+    ``PpSchedule`` instance passed in.
+    """
+
+    def prefill_batch(self, pp_schedule: "PpSchedule", args, com_buff=None) -> list:
+        raise NotImplementedError
+
+
+class OneFOneBBuilder(ScheduleBuilder):
+    """Non-interleaved 1F1B schedule (the historical ``prefill_batch`` body)."""
+
+    def prefill_batch(self, pp_schedule: "PpSchedule", args, com_buff=None) -> list:
+        return pp_schedule._prefill_batch_1f1b(args, com_buff=com_buff)
+
+
+class InterleavedVPPBuilder(ScheduleBuilder):
+    """Interleaved (VPP) schedule."""
+
+    def prefill_batch(self, pp_schedule: "PpSchedule", args, com_buff=None) -> list:
+        return pp_schedule._prefill_batch_interleaved(args, com_buff=com_buff)
+
+
+class DualPipeVBuilder(ScheduleBuilder):
+    """Reserved DualPipeV slot: F/B interleave of two microbatches with
+    cube/vector lane parallelism (design doc section 4.4)."""
+
+    def prefill_batch(self, pp_schedule: "PpSchedule", args, com_buff=None) -> list:
+        raise NotImplementedError(
+            "DualPipeVBuilder is a reserved slot and is not implemented yet; "
+            "see docs/design_simu_kind_resource_model.md section 4.4 (F/B "
+            "interleave of two microbatches, cube/vector lane parallelism)."
+        )
+
+
+SCHEDULE_BUILDERS = {
+    "1f1b": OneFOneBBuilder,
+    "interleaved": InterleavedVPPBuilder,
+    "dualpipe_v": DualPipeVBuilder,
+}
+
+
 class PpSchedule(MetaModule):
     """normal mlp layers"""
     def __init__(self, strategy:StrategyConfig, system, model) -> None:
@@ -715,9 +761,15 @@ class PpSchedule(MetaModule):
             return job
 
     def prefill_batch(self, args, com_buff=None):
-        if self.vp_size > 1:
-            return self._prefill_batch_interleaved(args, com_buff=com_buff)
+        # Selection reproduces the historical dispatch exactly: vp_size > 1
+        # uses the interleaved (VPP) builder, otherwise plain 1F1B. A future
+        # strategy field may select "dualpipe_v" here (design doc 4.4).
+        builder_name = "interleaved" if self.vp_size > 1 else "1f1b"
+        return SCHEDULE_BUILDERS[builder_name]().prefill_batch(
+            self, args, com_buff=com_buff
+        )
 
+    def _prefill_batch_1f1b(self, args, com_buff=None):
         job = []
         rank_info = get_rank_group(args.rank, self.strategy)
         pp_size = self.strategy.pp_size

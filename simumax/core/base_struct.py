@@ -6,6 +6,7 @@ from abc import ABC
 from typing import ClassVar, List, Tuple, Dict
 from collections import deque
 import heapq
+import itertools
 import time
 import types
 import multiprocessing
@@ -28,6 +29,7 @@ from simumax.core.model_struct import (
     RecomputeStatus,
 )
 from simumax.core.simu_events import EventSink
+from simumax.core.fusion import FusionPolicy
 from simumax.core.simu_memory import OpMemoryProfile
 from simumax.core.utils import get_point_name, to_json_string
 from simumax.core.utils import get_rank_group
@@ -2148,6 +2150,106 @@ class AtomModel(LeafModel):
         clone.forward_op = "recompute_fwd"
         return clone
     
+
+# Module-level id source for FusedOp correlation gids (design doc 4.3): all
+# lane slices of one fused op phase share the gid so the trace exporter can
+# render them as correlated slices.
+_FUSED_OP_ID_SEQ = itertools.count(1)
+
+
+def _next_fused_op_id():
+    return f"fused-{next(_FUSED_OP_ID_SEQ)}"
+
+
+class FusedOp(LeafModel):
+    """A fused multi-resource operator (design doc 4.3, Phase 3).
+
+    One logical op that occupies several resource lanes at once — e.g. a TP
+    all-gather fused with the following GEMM. The per-lane busy costs are
+    given up front; a FusionPolicy (simumax/core/fusion.py) composes them
+    into the op's total span and the per-lane busy durations.
+
+    Anchor rule: the op starts only when every declared lane AND the rank
+    anchor clock t["comp"] are free; on completion t["comp"] is set to
+    start + span, so the rank's next queued op sequences after the whole
+    fused unit (t["comp"] stays the queue-sequencing anchor clock), while
+    each declared lane advances independently to its own busy end.
+
+    step/bwd are overridden (like Com) because the base LeafModel wrapper
+    would emit a single comp-anchored span; a fused op instead emits one
+    slice per occupied lane, all sharing one gid (kind "fused",
+    stream/lane = the occupied lane) so the trace exporter can render them
+    as correlated slices on multiple lanes.
+
+    Builders are responsible for placing FusedOp instances into job queues;
+    no builder uses it yet in Phase 3 — this class is only the scheduling
+    and emission mechanism.
+    """
+
+    simu_kind = "fused"
+
+    def __init__(self, costs: Dict[str, float], policy: FusionPolicy,
+                 specific_name='', bwd_costs: Dict[str, float] = None, op_id=None):
+        # costs: dict lane_name -> busy ms, e.g. {"comp": 10.0, "comm": 8.0}.
+        # bwd_costs defaults to costs.
+        super().__init__(specific_name)
+        assert costs, "FusedOp requires a non-empty costs dict"
+        assert all(c >= 0 for c in costs.values()), f"negative lane cost in {costs}"
+        self.costs = dict(costs)
+        self.bwd_costs = dict(costs) if bwd_costs is None else dict(bwd_costs)
+        assert self.bwd_costs and all(c >= 0 for c in self.bwd_costs.values()), \
+            f"invalid bwd_costs {bwd_costs}"
+        self.policy = policy
+        # One gid per phase; every lane slice of a phase shares it. bwd uses a
+        # derived id so fwd/bwd slices never correlate with each other.
+        self.op_id = op_id if op_id is not None else _next_fused_op_id()
+        self._bwd_op_id = f"{self.op_id}-bwd"
+
+    @property
+    def simu_resources(self):
+        """Resource lanes this op occupies (from the forward costs)."""
+        return tuple(self.costs.keys())
+
+    def step(self, t, ctx):
+        # Overridden (like Com) so the base LeafModel wrapper does not emit
+        # its single comp-anchored span; _step emits the per-lane slices.
+        out = self._step(t, ctx)
+        ok, blk = out if isinstance(out, tuple) else (bool(out), None)
+        return (True, None) if ok else (False, blk)
+
+    def bwd(self, t, ctx):
+        out = self._bwd(t, ctx)
+        ok, blk = out if isinstance(out, tuple) else (bool(out), None)
+        return (True, None) if ok else (False, blk)
+
+    def _step(self, t, ctx):
+        return self._run_fused(t, ctx, self.costs, self.op_id, self.forward_op)
+
+    def _bwd(self, t, ctx):
+        return self._run_fused(t, ctx, self.bwd_costs, self._bwd_op_id, "bwd")
+
+    def _run_fused(self, t, ctx, costs, gid, phase):
+        # Never blocks: all sequencing inputs are local lane clocks.
+        lanes = set(costs) | {"comp"}
+        start = max(t[l] for l in lanes)
+        span = self.policy.span(costs)
+        lane_durs = self.policy.lane_durations(costs)
+        for lane, dur in lane_durs.items():
+            t[lane] = start + dur
+        # Anchor last: the rank's next queued op sequences after the fused
+        # unit even when "comp" itself is a declared (shorter) lane.
+        t["comp"] = start + span
+        for lane, dur in lane_durs.items():
+            if dur <= 0:
+                # Zero-cost lanes still advance their clock above but emit no
+                # slice — a zero-duration fused slice carries no information.
+                continue
+            ctx.event_sink.emit_span(
+                self.call_stk, phase, start, start + dur,
+                gid=gid, kind="fused", stream=lane, lane=lane,
+            )
+        return True
+
 class Com(LeafModel):
     simu_kind = "comm"
 

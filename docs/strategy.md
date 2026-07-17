@@ -265,3 +265,30 @@ For intermediate or locally patched runtimes, confirm the actual MoE path
 before choosing the flag.
 ### mem_factor
 Memory usage coefficient (0.94 means reserving 6% margin), used to estimate reserve_memory (=max_memory / mem_factor), default is 0.94
+
+## Simulation Resource Options (optional)
+
+These fields steer the DES resource-lane model behind `PerfLLM.simulate()`
+(see
+[design_simu_kind_resource_model.md](./design_simu_kind_resource_model.md)).
+All are optional; omitting them reproduces the current behavior.
+
+### compute_engine_map
+Maps a compute category to an engine lane declared in `system.engines`, e.g.
+`{"gemm": "cube", "elementwise": "vector"}`. Only meaningful when the system
+config declares the referenced engines; unmapped categories stay on the
+default compute lane.
+
+### fused_ops
+List of compute-communication fused ops. Each entry has the form
+`{"pattern": ..., "policy": "serial" | "max_overlap" | "chunked_pipeline", "chunks": n}`.
+For example, an AG+GEMM fused kernel:
+`[{"pattern": "tp_ag_gemm", "policy": "chunked_pipeline", "chunks": 4}]`.
+`chunks` only applies to the `chunked_pipeline` policy. Unconfigured means
+the current serial modeling.
+
+### fused_mem_mode
+Memory accounting mode for fused ops. `"steady_state"` (default) books the
+closed-form steady-state peak at op start. `"ramp"` is reserved for the
+faithful per-chunk ramp curve and currently falls back to `"steady_state"`
+with a warning.

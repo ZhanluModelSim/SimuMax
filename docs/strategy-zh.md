@@ -258,3 +258,26 @@ Megatron-LM 相关参数，用来决定 MoE 里 probs 的归属口径。
 如果是中间过渡版本或本地 patch 版本，先确认实际走到的 MoE 路径，再决定这个开关。
 ### mem_factor
 内存使用系数（0.94表示留6%的余量），用于估算reserve_memory（=max_memory / mem_factor），默认为0.94。
+
+## 模拟资源选项（可选）
+
+以下字段控制 `PerfLLM.simulate()` 背后的 DES 资源 lane 模型（见
+[design_simu_kind_resource_model-zh.md](./design_simu_kind_resource_model-zh.md)）。
+全部为可选字段；缺省时与当前行为一致。
+
+### compute_engine_map
+把计算类别映射到 `system.engines` 中声明的引擎 lane，例如
+`{"gemm": "cube", "elementwise": "vector"}`。仅当 system 配置声明了对应
+引擎时才生效；未映射的类别仍走默认 compute lane。
+
+### fused_ops
+通算融合算子列表。每项形如
+`{"pattern": ..., "policy": "serial" | "max_overlap" | "chunked_pipeline", "chunks": n}`。
+例如 AG+GEMM 融合 kernel 可配置为
+`[{"pattern": "tp_ag_gemm", "policy": "chunked_pipeline", "chunks": 4}]`。
+`chunks` 仅对 `chunked_pipeline` 策略生效。不配置时保持当前的串行建模。
+
+### fused_mem_mode
+融合算子的显存记账模式。`"steady_state"`（默认）在算子开始时按闭式
+稳态峰值记账。`"ramp"` 为忠实的逐 chunk 爬升曲线预留，目前会告警并
+回退到 `"steady_state"`。

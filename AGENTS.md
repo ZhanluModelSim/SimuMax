@@ -59,6 +59,10 @@ Key characteristics:
     `trace_export.py`, `simu_artifacts.py` — simulator execution, memory
     timeline/snapshots, and Chrome-trace (`tracing_logs.json`) export behind
     `PerfLLM.simulate()`.
+  - `simumax/core/simu_events.py` — structured DES event stream.
+  - `simumax/core/fusion.py` — fusion policies for fused ops. The DES
+    classifies ops via explicit `simu_kind` declarations (see
+    `docs/design_simu_kind_resource_model.md`).
   - `simumax/core/tensor.py` — `FakeTensor` shape/dtype carrier.
   - `simumax/pp_simu/utils.py` — DualPipe-style overlap/duration analytic
     helpers and plotting.

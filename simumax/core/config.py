@@ -11,6 +11,7 @@ import warnings
 import re
 
 from simumax.core.utils import to_json_string
+from simumax.core.fusion import FUSION_POLICIES, build_fusion_policy
 
 capture_graph_only = False
 ENABLE_SIMU_GRAPH = int(os.environ.get("ENABLE_SIMU_GRAPH", "0"))
@@ -296,6 +297,18 @@ class StrategyConfig(Config):
     # Megatron related
     dispatch_probs: bool = False # The new version of Megatron combines probs in Silu after Groupgemm1 in ExpertMLP
 
+    # Multi-resource fused ops (design doc 4.3/4.7, Phase 3 extension points).
+    # compute_engine_map maps compute categories (e.g. "gemm", "elementwise")
+    # to engine lane names; engine membership is validated when engine lanes
+    # are consumed (system.engines wiring is future work).
+    compute_engine_map: Optional[Dict[str, str]] = None
+    # Each fused_ops entry: {"pattern": str, "policy": one of FUSION_POLICIES
+    # (default "chunked_pipeline"), "chunks": int >= 1 (only meaningful for
+    # the chunked_pipeline policy)}.
+    fused_ops: Optional[List[dict]] = None
+    # Fused-op memory accounting mode (design doc 4.7/9.2); "ramp" is reserved.
+    fused_mem_mode: str = "steady_state"
+
     mem_factor: float = 0.94
     
     valid_recompute_granularity = [
@@ -316,6 +329,10 @@ class StrategyConfig(Config):
     valid_cp_a2a_modes = [
         "async_cp",
         "sync_cp",
+    ]
+    valid_fused_mem_modes = [
+        "steady_state",
+        "ramp",
     ]
     
     @classmethod
@@ -688,6 +705,52 @@ class StrategyConfig(Config):
 
         if self.recompute_granularity == "full_block":
             self.recompute_variance = False # megatron-LM's full recompute does not support variance
+
+        if self.compute_engine_map is not None:
+            assert isinstance(self.compute_engine_map, dict), (
+                f"compute_engine_map must be a dict of str -> str, but got {type(self.compute_engine_map)}"
+            )
+            for category, engine in self.compute_engine_map.items():
+                assert isinstance(category, str) and isinstance(engine, str), (
+                    f"compute_engine_map must map str -> str, but got {category!r} -> {engine!r}"
+                )
+
+        if self.fused_ops is not None:
+            assert isinstance(self.fused_ops, list), (
+                f"fused_ops must be a list of dicts, but got {type(self.fused_ops)}"
+            )
+            for idx, fused_op in enumerate(self.fused_ops):
+                assert isinstance(fused_op, dict), (
+                    f"fused_ops[{idx}] must be a dict, but got {type(fused_op)}"
+                )
+                unknown_keys = set(fused_op) - {"pattern", "policy", "chunks"}
+                assert not unknown_keys, (
+                    f"fused_ops[{idx}] has unknown keys {sorted(unknown_keys)}, "
+                    "allowed keys are ['chunks', 'pattern', 'policy']"
+                )
+                pattern = fused_op.get("pattern")
+                assert isinstance(pattern, str) and pattern, (
+                    f"fused_ops[{idx}]['pattern'] must be a non-empty str, but got {pattern!r}"
+                )
+                policy = fused_op.get("policy", "chunked_pipeline")
+                assert policy in FUSION_POLICIES, (
+                    f"fused_ops[{idx}]['policy'] {policy!r} must be one of {sorted(FUSION_POLICIES)}"
+                )
+                # chunks is only meaningful for the chunked_pipeline policy.
+                chunks = fused_op.get("chunks", 1)
+                assert isinstance(chunks, int) and not isinstance(chunks, bool) and chunks >= 1, (
+                    f"fused_ops[{idx}]['chunks'] must be an int >= 1, but got {chunks!r}"
+                )
+
+        assert self.fused_mem_mode in self.valid_fused_mem_modes, (
+            f"fused_mem_mode {self.fused_mem_mode} must be in [{','.join(self.valid_fused_mem_modes)}]"
+        )
+        if self.fused_mem_mode == "ramp":
+            warnings.warn(
+                "fused_mem_mode='ramp' is reserved but not yet implemented, "
+                "steady_state is used."
+            )
+            self.fused_mem_mode = "steady_state"
     def reset_global_batch_size(self, global_batch_size):
         assert global_batch_size % (self.dp_size * self.micro_batch_size)==0, f"global_batch_size {global_batch_size} must be divisible by dp_size*miro_batch_size(dp_size={self.dp_size}, micro_batch_size={self.micro_batch_size})"
         self.micro_batch_num = global_batch_size // (self.dp_size * self.micro_batch_size)
@@ -1054,6 +1117,18 @@ class SystemConfig(Config):
         if self.engines:
             lanes.extend(sorted(name for name in self.engines if name not in lanes))
         return lanes
+
+    def compute_fused_op_cost(self, costs: Dict[str, float], policy_spec) -> float:
+        """Dispatch entry for fused-op cost (design doc 4.3).
+
+        ``costs`` maps each occupied resource lane to its busy cost (ms);
+        ``policy_spec`` is a fusion policy name or a dict like
+        ``{"policy": "chunked_pipeline", "chunks": 4}`` (see
+        ``simumax.core.fusion``). Measured fused-kernel efficiency tables
+        hanging off system.json are reserved future work; until they exist
+        the fusion policy's analytic span is the cost.
+        """
+        return build_fusion_policy(policy_spec).span(costs)
 
     def sanity_check(self):
         if self.engines is None:

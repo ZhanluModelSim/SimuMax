@@ -210,6 +210,10 @@ def convert_to_tracing_format(parsed_logs):
         gid = log.get("gid")
         if not gid:
             continue
+        if log.get("kind") == "fused":
+            # Fused slices share a gid across resource lanes but are not
+            # send/recv pairs; they must not affect comm pairability.
+            continue
         call_stack = log.get("call_stack", [])
         if not call_stack:
             continue
@@ -227,6 +231,9 @@ def convert_to_tracing_format(parsed_logs):
 
     gid_to_correlation_id = {}
     corr_counter = 0
+    # Slices of one fused op (same gid) share an independent f<id> suffix.
+    gid_to_fused_corr_id = {}
+    fused_corr_counter = 0
 
     for log in parsed_logs:
         rank = log["rank"]
@@ -251,11 +258,14 @@ def convert_to_tracing_format(parsed_logs):
         if stream_type == "comm":
             stream = log.get("stream") or "comp"
             lane = log.get("lane") or (stream if stream != "comp" else "comm")
+        elif stream_type == "fused":
+            # Each fused slice renders on the resource lane it occupies.
+            lane = log.get("stream") or "comp"
         else:
             lane = stream_type
         if stream_type == "wait":
             tid = "wait"
-        elif stream_type == "comm":
+        elif stream_type in ("comm", "fused"):
             tid = lane
         elif stream_type == "scope" and base_name.startswith("batch_pp"):
             tid = "pp_batch_scope"
@@ -268,10 +278,19 @@ def convert_to_tracing_format(parsed_logs):
                 gid_to_correlation_id[gid] = corr_counter
                 corr_counter += 1
             corr_id = gid_to_correlation_id[gid]
+        fused_corr_id = None
+        if stream_type == "fused" and gid:
+            if gid not in gid_to_fused_corr_id:
+                gid_to_fused_corr_id[gid] = fused_corr_counter
+                fused_corr_counter += 1
+            fused_corr_id = gid_to_fused_corr_id[gid]
         name = base_name
         if corr_id is not None:
             # Visual grouping without flow lines: same comm pair gets same g<id>.
             name = f"{base_name}[g{corr_id}]"
+        if fused_corr_id is not None:
+            # Slices of the same fused op share one f<id> across lane slices.
+            name = f"{base_name}[f{fused_corr_id}]"
 
         event_id = event_id_counter
         event_id_counter += 1

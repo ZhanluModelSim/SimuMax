@@ -407,3 +407,24 @@ For example, detailed configuration of continuous two-card communication bandwid
 
         },
 ```
+
+## engines
+
+Optional dict declaring extra hardware engine lanes for the DES resource
+model, for example:
+
+```json
+"engines": {
+    "cube": {"peak_tflops": 320},
+    "vector": {"peak_tflops": 80}
+}
+```
+
+- Absent means a single engine, which reproduces the current behavior.
+- Engine names must be valid identifiers and must not collide with the
+  reserved lane names `comp`, `comm`, `pp_fwd`, `pp_bwd`, and `off`.
+- Vector-lane costs currently use peak-scaled analytic estimates (design
+  decision 9.1 in
+  [design_simu_kind_resource_model.md](./design_simu_kind_resource_model.md)),
+  so each engine entry only carries scalar peaks such as `peak_tflops`; a
+  measured efficiency table can be added later without interface changes.
