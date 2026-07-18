@@ -289,7 +289,7 @@ class Permutation(MetaModule):
             )   
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))      
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))      
             state.comm_order += 1
         if self.strategy.etp_size > 1:
             comm_size = (
@@ -307,7 +307,7 @@ class Permutation(MetaModule):
             ) 
             self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size,))
             state.comm_order += 1
 
         #permutate2 after ep all2all and tp
@@ -616,7 +616,7 @@ class UnPermutation(MetaModule):
             ) 
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size,))
             state.comm_order += 1
 
 
@@ -633,7 +633,7 @@ class UnPermutation(MetaModule):
             )   
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))      
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.ep_net, size_bytes=comm_size))      
             state.comm_order += 1
 
         #permutate2 and combine

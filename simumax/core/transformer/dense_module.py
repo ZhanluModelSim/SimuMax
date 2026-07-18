@@ -54,7 +54,7 @@ class Embedding(MetaModule):
             )
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))
             state.comm_order += 1
         elif self.strategy.tp_size > 1:
             comm_size = (
@@ -72,7 +72,7 @@ class Embedding(MetaModule):
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=0, global_rank=args.rank))
+                                         fwd_cost=cost, bwd_cost=0, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))
             state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -262,7 +262,7 @@ class LinearCol(LinearBase):
             )
             self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank))#'comm all_gather input/ bwd:rs'
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))#'comm all_gather input/ bwd:rs'
             state.comm_order += 1
 
         elif self.strategy.tp_size > 1:
@@ -280,7 +280,7 @@ class LinearCol(LinearBase):
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=0, bwd_cost=cost, global_rank=args.rank))
+                                         fwd_cost=0, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))
             state.comm_order += 1
         #linear
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
@@ -302,7 +302,7 @@ class LinearCol(LinearBase):
             )
             self.layers.append(all_gather_bwd(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=0, bwd_cost=cost, global_rank=args.rank))  #gather again in bwd to save memory
+                                         fwd_cost=0, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))  #gather again in bwd to save memory
             state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -595,7 +595,7 @@ class LinearRow(LinearBase):
             
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size,  com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))
             state.comm_order += 1
         elif self.strategy.tp_size > 1:
             comm_size = (
@@ -612,7 +612,7 @@ class LinearRow(LinearBase):
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size,  com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=0, global_rank=args.rank))
+                                         fwd_cost=cost, bwd_cost=0, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size))
             state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -1252,6 +1252,8 @@ class CoreAttention(MetaModule):
                     fwd_cost=fwd_cost,
                     bwd_cost=bwd_cost,
                     global_rank=args.rank,
+                    net=self.strategy.cp_net,
+                    size_bytes=comm_size,
                 )
             )
             state.comm_order += 1
@@ -2184,7 +2186,7 @@ class ParallelCE(MetaModule):
         # comm_size = "B*S"
         self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                 rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                fwd_cost=cost1, bwd_cost=0, global_rank=args.rank))
+                                fwd_cost=cost1, bwd_cost=0, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size1))
         state.comm_order += 1
         if self.strategy.cross_entropy_loss_fusion:
             # Fused CE batches predicted_logits and sum_exp_logits into one
@@ -2197,19 +2199,19 @@ class ParallelCE(MetaModule):
                 strategy=self.strategy,
                 group_kind="tp",
             )
-            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}",
                                     rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                    fwd_cost=cost2, bwd_cost=0, global_rank=args.rank))
+                                    fwd_cost=cost2, bwd_cost=0, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size2 * 2))
         else:
             # comm_size = "B*S*V"
-            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}",
                                     rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                    fwd_cost=cost2, bwd_cost=0, global_rank=args.rank))
+                                    fwd_cost=cost2, bwd_cost=0, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size2))
             state.comm_order += 1
             # comm_size = "B*S"
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                     rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                    fwd_cost=cost1, bwd_cost=0, global_rank=args.rank))
+                                    fwd_cost=cost1, bwd_cost=0, global_rank=args.rank, net=self.strategy.tp_net, size_bytes=comm_size1))
         state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)

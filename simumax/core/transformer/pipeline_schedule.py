@@ -51,13 +51,13 @@ class OptimizerSimulator(MetaModule):
             cost_dense_rs =  cost_dense['details']['reduce_scatter_time']
             self.layers.append(reduce_scatter(f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}", 
                                 rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,  com_buff=com_buff,
-                                fwd_cost=cost_dense_rs, global_rank=args.rank))
+                                fwd_cost=cost_dense_rs, global_rank=args.rank, net=self.strategy.dp_net))
             state.comm_order += 1
             
             cost_moe_rs =  cost_moe['details']['reduce_scatter_time']
             self.layers.append(reduce_scatter(f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}", 
                                 rank_info['edp_rank'], self.strategy.edp_size,  com_buff=com_buff,
-                                fwd_cost=cost_moe_rs, global_rank=args.rank))
+                                fwd_cost=cost_moe_rs, global_rank=args.rank, net=self.strategy.edp_net))
             state.comm_order += 1            
             
             
@@ -71,13 +71,13 @@ class OptimizerSimulator(MetaModule):
             cost_dense_ag =  cost_dense['details']['all_gather_time']
             self.layers.append(all_gather(f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}", 
                                 rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,  com_buff=com_buff,
-                                fwd_cost=cost_dense_ag, global_rank=args.rank))
+                                fwd_cost=cost_dense_ag, global_rank=args.rank, net=self.strategy.dp_net))
             state.comm_order += 1
 
             cost_moe_ag =  cost_moe['details']['all_gather_time']
             self.layers.append(all_gather(f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}", 
                                 rank_info['edp_rank'], self.strategy.edp_size,  com_buff=com_buff,
-                                fwd_cost=cost_moe_ag, global_rank=args.rank))
+                                fwd_cost=cost_moe_ag, global_rank=args.rank, net=self.strategy.edp_net))
             state.comm_order += 1
 
         else:
@@ -228,7 +228,7 @@ class PpSchedule(MetaModule):
                 id=f'forward-v{virtual_idx}-mb{real_mb}-pp_group:{pp_group}-',
                 rank=pp_rank,
                 pp_size=pp_size,
-                fwd_cost=pp_cost,
+                fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                 global_rank=args.rank,
                 call_stk=f"rank{args.rank}",
             )
@@ -238,7 +238,7 @@ class PpSchedule(MetaModule):
                 id=f'backward-v{virtual_idx}-mb{real_mb}-pp_group:{pp_group}-',
                 rank=pp_rank,
                 pp_size=pp_size,
-                fwd_cost=pp_cost,
+                fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                 global_rank=args.rank,
                 call_stk=f"rank{args.rank}",
             )
@@ -260,7 +260,7 @@ class PpSchedule(MetaModule):
                     id=f'forward-v{virtual_idx + 1}-mb{real_mb}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -273,7 +273,7 @@ class PpSchedule(MetaModule):
                     id=f'backward-v{virtual_idx - 1}-mb{real_mb}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -321,7 +321,7 @@ class PpSchedule(MetaModule):
                     id=f'forward-v{virtual_idx}-mb{real_mb}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -341,7 +341,7 @@ class PpSchedule(MetaModule):
                     id=f'backward-v{virtual_idx}-mb{real_mb}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -401,7 +401,7 @@ class PpSchedule(MetaModule):
                                     rank=pp_rank,
                                     pp_size=pp_size,
                                     com_buff=com_buff,
-                                    fwd_cost=pp_cost,
+                                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                                     global_rank=args.rank,
                                     call_stk=f"rank{args.rank}",
                                 )
@@ -433,7 +433,7 @@ class PpSchedule(MetaModule):
                         rank=pp_rank,
                         pp_size=pp_size,
                         com_buff=com_buff,
-                        fwd_cost=pp_cost,
+                        fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                         global_rank=args.rank,
                         call_stk=f"rank{args.rank}",
                     )
@@ -445,7 +445,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -461,7 +461,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -473,7 +473,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -499,7 +499,7 @@ class PpSchedule(MetaModule):
                                     rank=pp_rank,
                                     pp_size=pp_size,
                                     com_buff=com_buff,
-                                    fwd_cost=pp_cost,
+                                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                                     global_rank=args.rank,
                                     call_stk=f"rank{args.rank}",
                                 )
@@ -534,7 +534,7 @@ class PpSchedule(MetaModule):
                         rank=pp_rank,
                         pp_size=pp_size,
                         com_buff=com_buff,
-                        fwd_cost=pp_cost,
+                        fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                         global_rank=args.rank,
                         call_stk=f"rank{args.rank}",
                     )
@@ -544,7 +544,7 @@ class PpSchedule(MetaModule):
                         rank=pp_rank,
                         pp_size=pp_size,
                         com_buff=com_buff,
-                        fwd_cost=pp_cost,
+                        fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                         global_rank=args.rank,
                         call_stk=f"rank{args.rank}",
                     )
@@ -556,7 +556,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -568,7 +568,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -598,7 +598,7 @@ class PpSchedule(MetaModule):
                         rank=pp_rank,
                         pp_size=pp_size,
                         com_buff=com_buff,
-                        fwd_cost=pp_cost,
+                        fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                         global_rank=args.rank,
                         call_stk=f"rank{args.rank}",
                     )
@@ -610,7 +610,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -626,7 +626,7 @@ class PpSchedule(MetaModule):
                             rank=pp_rank,
                             pp_size=pp_size,
                             com_buff=com_buff,
-                            fwd_cost=pp_cost,
+                            fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                             global_rank=args.rank,
                             call_stk=f"rank{args.rank}",
                         )
@@ -649,7 +649,7 @@ class PpSchedule(MetaModule):
                                     id=f'forward-v{virtual_idx0}-mb{real_mb0}-pp_group:{pp_group}-',
                                     rank=pp_rank,
                                     pp_size=pp_size,
-                                    fwd_cost=pp_cost,
+                                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                                     global_rank=args.rank,
                                     call_stk=f"rank{args.rank}",
                                 )
@@ -793,7 +793,7 @@ class PpSchedule(MetaModule):
                     id=f'forward-{fwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -802,7 +802,7 @@ class PpSchedule(MetaModule):
                     id=f'forward-{fwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     com_buff=com_buff,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     pp_size=pp_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
@@ -816,7 +816,7 @@ class PpSchedule(MetaModule):
                 id=f'forward-{fwd_idx}-pp_group:{pp_group}-',
                 rank=pp_rank,
                 pp_size=pp_size,
-                fwd_cost=pp_cost,
+                fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                 global_rank=args.rank,
                 call_stk=f"rank{args.rank}",
             )
@@ -830,7 +830,7 @@ class PpSchedule(MetaModule):
                     id=f'forward-{fwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -839,7 +839,7 @@ class PpSchedule(MetaModule):
                     id=f'forward-{fwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     com_buff=com_buff,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     pp_size=pp_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
@@ -854,7 +854,7 @@ class PpSchedule(MetaModule):
                     id=f'backward-{bwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -863,7 +863,7 @@ class PpSchedule(MetaModule):
                     id=f'backward-{bwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     com_buff=com_buff,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     pp_size=pp_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
@@ -877,7 +877,7 @@ class PpSchedule(MetaModule):
                 id=f'backward-{bwd_idx}-pp_group:{pp_group}-',
                 rank=pp_rank,
                 pp_size=pp_size,
-                fwd_cost=pp_cost,
+                fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                 global_rank=args.rank,
                 call_stk=f"rank{args.rank}",
             )
@@ -891,7 +891,7 @@ class PpSchedule(MetaModule):
                     id=f'backward-{bwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     pp_size=pp_size,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
                 )
@@ -900,7 +900,7 @@ class PpSchedule(MetaModule):
                     id=f'backward-{bwd_idx}-pp_group:{pp_group}-',
                     rank=pp_rank,
                     com_buff=com_buff,
-                    fwd_cost=pp_cost,
+                    fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size,
                     pp_size=pp_size,
                     global_rank=args.rank,
                     call_stk=f"rank{args.rank}",
@@ -956,9 +956,9 @@ class PpSchedule(MetaModule):
                         _append_post_recv_next_backward(bwd_idx + 1)
                 else:
                     que = []
-                    comm1 = send_next(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, pp_size=pp_size,global_rank=args.rank, call_stk=f"rank{args.rank}")
+                    comm1 = send_next(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size, pp_size=pp_size,global_rank=args.rank, call_stk=f"rank{args.rank}")
                     que.append(comm1)
-                    comm2 = recv_next(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
+                    comm2 = recv_next(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
                     que.append(comm2)
                     if pp_rank % 2:
                         comm_que = FwdQue(que=que)
@@ -986,9 +986,9 @@ class PpSchedule(MetaModule):
                         _append_post_recv_prev_forward(fwd_idx)
                     else:
                         que = []
-                        comm1 = send_prev(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
+                        comm1 = send_prev(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
                         que.append(comm1)
-                        comm2 = recv_prev(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
+                        comm2 = recv_prev(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=pp_cost, net=self.strategy.pp_net, size_bytes=pp_comm_size, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
                         que.append(comm2)
                         if pp_rank % 2:
                             comm_que = FwdQue(que=que)

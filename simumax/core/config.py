@@ -822,6 +822,13 @@ class SystemConfig(Config):
     # {"cube": {"peak_tflops": 320}, "vector": {"peak_tflops": 80}}.
     # None means single-engine, which reproduces the current behavior.
     engines: Optional[Dict[str, dict]] = None
+    # Network fabric model selection (network-fabric design doc section 6):
+    # None = off (current behavior), "nic" = per-GPU NIC servers,
+    # "nic+tor" = additionally activates ToR servers (Preview).
+    fabric_model: Optional[str] = None
+    # Fabric topology knobs; reserved keys are "tor_capacity_gbps"
+    # (number) and "tor_node_share" ("auto" or number >= 1).
+    topology: Optional[Dict[str, Any]] = None
 
     @classmethod
     def init_from_dict(cls, config_dict: Dict[str, Any]):
@@ -848,6 +855,8 @@ class SystemConfig(Config):
         }
         FC8 = config_dict.pop("FC8", False)
         engines = config_dict.pop("engines", None)
+        fabric_model = config_dict.pop("fabric_model", None)
+        topology = config_dict.pop("topology", None)
         return cls(
             sys_name=sys_name,
             num_per_node=num_per_node,
@@ -856,6 +865,8 @@ class SystemConfig(Config):
             FC8=FC8,
             intra_with_pcie = intra_with_pcie,
             engines=engines,
+            fabric_model=fabric_model,
+            topology=topology,
         )
     
     def record_miss_efficiency(self, op_name:str, flops:int, shape_desc:str, use_eff):
@@ -1129,6 +1140,11 @@ class SystemConfig(Config):
     # ("off" is the idle lane of SimuThread's lane clock, see design doc 4.2).
     RESERVED_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd", "off")
 
+    # Fabric model choices (network-fabric design doc section 6); None = off.
+    FABRIC_MODELS = ("nic", "nic+tor")
+    # Reserved keys of the `topology` dict.
+    RESERVED_TOPOLOGY_KEYS = ("tor_capacity_gbps", "tor_node_share")
+
     def simu_resource_lanes(self) -> list[str]:
         """Pinned resource-lane contract for the simulator (design doc 4.2).
 
@@ -1153,6 +1169,10 @@ class SystemConfig(Config):
         return build_fusion_policy(policy_spec).span(costs)
 
     def sanity_check(self):
+        self._sanity_check_engines()
+        self._sanity_check_fabric()
+
+    def _sanity_check_engines(self):
         if self.engines is None:
             return
         assert isinstance(self.engines, dict), (
@@ -1174,6 +1194,41 @@ class SystemConfig(Config):
             if peak_tflops is not None:
                 assert isinstance(peak_tflops, (int, float)) and not isinstance(peak_tflops, bool), (
                     f"engines[{name!r}]['peak_tflops'] must be numeric, but got {peak_tflops!r}"
+                )
+
+    def _sanity_check_fabric(self):
+        assert self.fabric_model in (None, *self.FABRIC_MODELS), (
+            f"fabric_model must be one of None, 'nic', 'nic+tor', "
+            f"but got {self.fabric_model!r}"
+        )
+        if self.topology is None:
+            return
+        if self.fabric_model is None:
+            warnings.warn(
+                "topology is set but fabric_model is None; topology is only "
+                "meaningful with fabric_model 'nic' or 'nic+tor'"
+            )
+        assert isinstance(self.topology, dict), (
+            f"topology must be a dict, but got {type(self.topology)}"
+        )
+        reserved_keys = set(self.RESERVED_TOPOLOGY_KEYS)
+        for key, value in self.topology.items():
+            assert key in reserved_keys, (
+                f"unknown topology key {key!r}, "
+                f"reserved keys are {sorted(reserved_keys)}"
+            )
+            if key == "tor_capacity_gbps":
+                assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+                    f"topology['tor_capacity_gbps'] must be numeric, but got {value!r}"
+                )
+            elif key == "tor_node_share" and value != "auto":
+                assert (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value >= 1
+                ), (
+                    "topology['tor_node_share'] must be 'auto' or a number >= 1, "
+                    f"but got {value!r}"
                 )
 
 

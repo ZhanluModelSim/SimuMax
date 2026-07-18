@@ -152,10 +152,18 @@ drain 中处理（`SimuSystem.simu` 的 pending-completions 段）。
   NIC 完全归它自己。
 - ToR 服务台（预留）需要节点份额放大：`merge_lanes=True` 时每节点
   只模拟 1/`num_per_node` 个 rank，ToR 服务台只能看到节点真实流量的
-  1/num_per_node。预留模型：每条 entry 记录 `meta["node_share"]`
-  （merge_lanes 下 ≈ `num_per_node`，否则为 1）；ToR 激活时占用时长
-  按 `cost * node_share` 计。ToR 容量默认 `inter_node.gbps`（节点上
-  行），可在 `topology` 中覆盖。
+  1/num_per_node。预留模型：`tor_node_share`（merge_lanes 下 ≈
+  `num_per_node`，否则为 1）放大每条 entry 的 ToR 占用。占用时长 =
+  `size_bytes / tor_capacity * node_share`（缺 size/容量时回退
+  `cost * node_share / num_per_node`）。ToR 容量默认
+  `inter_node.gbps`（节点上行），因此默认 share 下 ToR 占用等于
+  per-NIC 服务时长，同构节点流量下 ToR 不会比 NIC 更紧；只有当
+  `topology.tor_capacity_gbps` 建模超卖时 ToR 才绑定。（早期草案按
+  `cost * node_share` 计费——那等效于把上行设为单 NIC 带宽，悲观了约
+  num_per_node 倍，16384 卡 A/B 已证实；上面的 size 公式才是物理
+  自洽的。）注意：`size_bytes` 是原始消息大小，cost 中带跨节点流量
+  比例修正的 op（all2all 的 `(k-1)/k`）在 ToR 上按全量计费——略有
+  高估，作为 Preview 限制接受。
 - 跨 stage 的 PP p2p 两端经现有代表 rank 映射；`default_group` 保持
   纯屏障。
 

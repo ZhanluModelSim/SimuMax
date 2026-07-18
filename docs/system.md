@@ -428,3 +428,30 @@ model, for example:
   [design_simu_kind_resource_model.md](./design_simu_kind_resource_model.md)),
   so each engine entry only carries scalar peaks such as `peak_tflops`; a
   measured efficiency table can be added later without interface changes.
+
+## fabric_model / topology (Preview)
+
+Optional fields enabling the network-fabric contention model of the DES
+(section 6 of
+[design_simu_network_fabric.md](./design_simu_network_fabric.md)):
+
+```json
+"fabric_model": "nic",
+"topology": {
+    "tor_capacity_gbps": 1600,
+    "tor_node_share": "auto"
+}
+```
+
+- `fabric_model`: absent/`null` (default) disables fabric modeling and
+  reproduces the current behavior; `"nic"` enables per-GPU NIC servers so
+  that `inter_node` ops queue on their rank's NIC; `"nic+tor"`
+  additionally activates top-of-rack (ToR) servers (Preview).
+- `topology.tor_capacity_gbps`: ToR server capacity; defaults to
+  `inter_node.gbps` (the node uplink).
+- `topology.tor_node_share`: `"auto"` or a number >= 1. `"auto"` resolves
+  to `num_per_node` under `merge_lanes` (only one rank per node is
+  simulated, so a ToR server would otherwise see only 1/num_per_node of
+  the node's real traffic) and to `1` otherwise.
+- `topology` is only meaningful together with `fabric_model`; setting it
+  while `fabric_model` is absent triggers a warning.

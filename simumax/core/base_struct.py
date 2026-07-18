@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from abc import ABC
 from typing import ClassVar, List, Tuple, Dict
-from collections import deque
+from collections import defaultdict, deque
 import heapq
 import itertools
 import time
@@ -1320,6 +1320,66 @@ class P2PBackend:
         return False, None, None
 
 
+class NetworkFabric:
+    """Per-GPU NIC servers (+ reserved per-node ToR servers).
+
+    One NIC server per GPU, keyed by global rank; one reserved ToR server per
+    node, keyed by ``rank // num_per_node``. Server state is a single tail
+    clock per server (``nic_tail[rank]`` / ``tor_tail[node]``), mirroring
+    ``rank_comm_tail``. Fabric servers never modify an op's ``cost``; they
+    only shift its ``launch_t``/``ready_t`` (network-fabric design doc 5.3).
+    ToR servers default to non-constraining (pass-through) until
+    ``tor_enabled`` is switched on (design doc 5.1/5.5, decision 3).
+    """
+
+    def __init__(self, num_per_node, tor_enabled=False, tor_node_share=1,
+                 tor_capacity_gbps=None):
+        self.num_per_node = num_per_node
+        self.tor_enabled = tor_enabled
+        self.tor_node_share = tor_node_share
+        # ToR service rate; when None, ToR occupancy falls back to the
+        # cost-based formula below (which keeps ToR from binding harder than
+        # the per-GPU NIC for isomorphic node traffic).
+        self.tor_capacity_gbps = tor_capacity_gbps
+        self.nic_tail = defaultdict(float)  # rank -> NIC busy until
+        self.tor_tail = defaultdict(float)  # node -> ToR busy until
+
+    def node_of(self, rank):
+        return rank // self.num_per_node
+
+    def acquire(self, rank, t):
+        """Earliest start on rank's NIC (and ToR when enabled)."""
+        t = max(t, self.nic_tail[rank])
+        if self.tor_enabled:
+            t = max(t, self.tor_tail[self.node_of(rank)])
+        return t
+
+    def tor_occupancy(self, cost, size_bytes):
+        """ToR service time of one entry (ms), amplified by node_share.
+
+        With a capacity: size / tor_capacity * share. With the defaults
+        (tor_capacity = node uplink, share = num_per_node) this equals the
+        per-NIC service time, so ToR never binds harder than the NIC for
+        isomorphic node traffic; it only binds when the user models
+        oversubscription (capacity < num_per_node * per-NIC bandwidth).
+        Fallback without size/capacity: cost * share / num_per_node, which
+        has the same neutral default.
+        """
+        if size_bytes and self.tor_capacity_gbps:
+            return (size_bytes / (self.tor_capacity_gbps * 1024**3) * 1e3
+                    * self.tor_node_share)
+        return cost * self.tor_node_share / self.num_per_node
+
+    def charge(self, rank, end_t, cost, size_bytes=0):
+        self.nic_tail[rank] = max(self.nic_tail[rank], end_t)
+        if self.tor_enabled:
+            node = self.node_of(rank)
+            launch_t = end_t - cost
+            self.tor_tail[node] = max(
+                self.tor_tail[node], launch_t + self.tor_occupancy(cost, size_bytes)
+            )
+
+
 @dataclass
 class CommEntry:
     eid: int
@@ -1452,6 +1512,9 @@ class SimuSystem:
             push(r)
 
         done = set()
+        # gids of blocking p2p completions already charged to the fabric, so
+        # retried/cached completions of the same gid never double-charge.
+        fabric_charged_gids = set()
         while len(done) < len(threads_by_rank):
             if not heap:
                 print("DEADLOCK: heap empty")
@@ -1526,7 +1589,7 @@ class SimuSystem:
 
             # Handle completions triggered by this step via pending_completions.
             while ctx.pending_completions:
-                gid, waiters, end_t, stream = ctx.pending_completions.pop()
+                gid, waiters, end_t, stream, fabric_charge = ctx.pending_completions.pop()
                 for w in waiters:
                     th = threads_by_rank[w]
                     # Blocking collectives are synchronous at rank level:
@@ -1540,6 +1603,16 @@ class SimuSystem:
                     if blocked_on.get(w) == ("barrier", gid):
                         del blocked_on[w]
                         push(w)
+                # Blocking p2p charges BOTH ends (decision 1): every waiter's
+                # NIC is set to the common barrier end_t, applied in the same
+                # drain that raises their lane clocks. Keyed on the gid so
+                # retried/cached completions never double-charge.
+                if fabric_charge is not None and gid not in fabric_charged_gids:
+                    fabric_charged_gids.add(gid)
+                    charge_end_t, charge_cost, charge_size = fabric_charge
+                    for w in waiters:
+                        ctx.fabric.charge(w, charge_end_t, charge_cost,
+                                          size_bytes=charge_size)
             while ctx.pending_comm_entry_completions:
                 eid = ctx.pending_comm_entry_completions.pop()
                 to_unblock = [w for w, wait_key in list(blocked_on.items()) if wait_key == ("comm_entry", eid)]
@@ -1579,10 +1652,10 @@ class SimuSystem:
 
 class SimuContext:
     def __init__(self, backend, merge_lanes=True, log_path='./tmp/log.log', sync_lanes=False,
-                 resource_lanes=None):
+                 resource_lanes=None, fabric=None):
         self.backend = backend
         self.p2p_backend = P2PBackend()
-        self.pending_completions = []  # list[(waiters, end_t, stream)]
+        self.pending_completions = []  # list[(gid, waiters, end_t, stream, fabric_charge)]
         self.pending_comm_entry_completions = []  # list[eid]
         self.pending_async_finalizations = []  # list[gid], LIFO for compatibility
         self.pending_async_posts = []  # list[gid], LIFO for compatibility
@@ -1603,6 +1676,9 @@ class SimuContext:
         # Resource-lane names shared by all threads (design doc 4.2); kept on
         # the context so comm code can resolve lane membership if needed.
         self.resource_lanes = resource_lanes
+        # NetworkFabric servers (network-fabric design doc 5); None = off,
+        # which reproduces the pre-fabric behavior bit for bit.
+        self.fabric = fabric
 
 
     @staticmethod
@@ -1669,6 +1745,8 @@ class SimuContext:
         mode,
         call_stk,
         log_id,
+        net=None,
+        size_bytes=0,
     ):
         order = self.next_issue_seq()
         self.register_async_send(
@@ -1691,7 +1769,7 @@ class SimuContext:
             expected=2,
             log_call_stk=call_stk,
             log_id=log_id,
-            meta={"post_order": order, "post_ts": post_t},
+            meta={"post_order": order, "post_ts": post_t, "net": net, "size_bytes": size_bytes},
         )
         self.attach_async_send_eid(gid, eid)
         self.pump_comm_queue()
@@ -1708,6 +1786,8 @@ class SimuContext:
         mode,
         call_stk,
         log_id,
+        net=None,
+        size_bytes=0,
     ):
         order = self.next_issue_seq()
         self.register_async_recv(
@@ -1730,7 +1810,7 @@ class SimuContext:
             expected=2,
             log_call_stk=call_stk,
             log_id=log_id,
-            meta={"post_order": order, "post_ts": post_t},
+            meta={"post_order": order, "post_ts": post_t, "net": net, "size_bytes": size_bytes},
         )
         self.attach_async_recv_eid(gid, eid)
         self.pump_comm_queue()
@@ -1880,6 +1960,12 @@ class SimuContext:
         entry.end_t = end_t
         queue.popleft()
         self.rank_comm_tail[lane_key] = end_t
+        # Uniform fabric charge (network-fabric design doc 5.3): covers local
+        # entries, rendezvous waiters, and async p2p send/recv entries (both
+        # ends get their own entries, so both ends are charged — decision 1).
+        if self.fabric is not None and entry.meta.get("net") == "inter_node":
+            self.fabric.charge(rank, end_t, entry.cost,
+                               size_bytes=entry.meta.get("size_bytes", 0))
         if self.threads_by_rank is not None and rank in self.threads_by_rank:
             self.threads_by_rank[rank].t[entry.stream] = max(self.threads_by_rank[rank].t[entry.stream], end_t)
         self.pending_comm_entry_completions.append(eid)
@@ -1918,6 +2004,10 @@ class SimuContext:
         entry = self.comm_entries[eid]
         rank = entry.rank
         launch_t = max(entry.issue_t, self.get_rank_comm_tail(rank, entry.stream))
+        # Inter-node ops additionally serialize on the rank's NIC (and ToR
+        # when enabled); the fabric only shifts launch_t, never cost.
+        if self.fabric is not None and entry.meta.get("net") == "inter_node":
+            launch_t = self.fabric.acquire(rank, launch_t)
         end_t = launch_t + entry.cost
         self._complete_comm_entry(eid, launch_t, end_t)
 
@@ -1933,6 +2023,10 @@ class SimuContext:
             # actually arrive.
             return
         ready_t = max(entry.issue_t, self.get_rank_comm_tail(rank, entry.stream))
+        # Each inter-node waiter acquires its NIC (and ToR when enabled)
+        # before arriving at the backend (network-fabric design doc 5.3).
+        if self.fabric is not None and entry.meta.get("net") == "inter_node":
+            ready_t = self.fabric.acquire(rank, ready_t)
         entry.ready_t = ready_t
         if entry.backend_kind == "p2p":
             done, waiters, end_t = self.p2p_backend.arrive(entry.gid, rank, ready_t, entry.cost)
@@ -1969,6 +2063,8 @@ class SimuContext:
                 waiter_ready_t = max(
                     waiter_entry.issue_t, self.get_rank_comm_tail(waiter_rank, waiter_entry.stream)
                 )
+                if self.fabric is not None and waiter_entry.meta.get("net") == "inter_node":
+                    waiter_ready_t = self.fabric.acquire(waiter_rank, waiter_ready_t)
                 waiter_entry.ready_t = waiter_ready_t
             launch_t = max(waiter_ready_t, end_t - waiter_entry.cost)
             self._complete_comm_entry(waiter_eid, launch_t, end_t)
@@ -2254,7 +2350,7 @@ class Com(LeafModel):
     simu_kind = "comm"
 
     def __init__(self, id, rank, group_size, com_buff=None, fwd_cost=0, bwd_cost=0,
-                 call_stk='', global_rank=None, stream="comm"):
+                 call_stk='', global_rank=None, stream="comm", net=None, size_bytes=0):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
         self.id = id
@@ -2264,6 +2360,11 @@ class Com(LeafModel):
         self.bwd_cost = bwd_cost
         self.global_rank = global_rank
         self.stream = stream
+        # Resolved strategy net name ("inter_node"/"intra_node"/...) and
+        # payload size; net is None for unmigrated call sites, which keeps the
+        # op out of fabric charging (network-fabric design doc 5.2).
+        self.net = net
+        self.size_bytes = size_bytes
         self._completed = set()  # store completed gid for this rank/op
         self._fwd_launch_st = None
         self._bwd_launch_st = None
@@ -2367,6 +2468,7 @@ class Com(LeafModel):
                 expected=expected,
                 log_call_stk=self.call_stk,
                 log_id=self.id,
+                meta={"net": self.net, "size_bytes": self.size_bytes},
             )
             # Faithful post marker (design doc 9.3): the post happens at issue;
             # the completion span follows from the step wrapper as before.
@@ -2413,6 +2515,7 @@ class Com(LeafModel):
                 expected=expected,
                 log_call_stk=self.call_stk,
                 log_id=self.id,
+                meta={"net": self.net, "size_bytes": self.size_bytes},
             )
             # Faithful post marker (design doc 9.3): the post happens at issue;
             # the completion span follows from the bwd wrapper as before.
@@ -2441,6 +2544,11 @@ class Com(LeafModel):
         m = max(t["comp"], t["comm"])
         t["comp"] = t["comm"] = m
         ready_t = self._batch_submit_by_gid.get(gid, t[self.stream])
+        # Inter-node blocking p2p acquires this rank's NIC (and ToR when
+        # enabled) at arrival; only first arrivals use ready_t, so retries
+        # re-acquire harmlessly (network-fabric design doc 5.3).
+        if ctx.fabric is not None and self.net == "inter_node":
+            ready_t = ctx.fabric.acquire(self.global_rank, ready_t)
         first_arrival = gid not in self._blocking_start_by_gid
         done, waiters, end_t = ctx.backend.arrive(gid, self.global_rank, ready_t, 2, cost)
         if first_arrival:
@@ -2465,11 +2573,17 @@ class Com(LeafModel):
         # is earlier than the rank's current visible time (for example, when a
         # longer sibling op in the same batch finished later). Never move local
         # time backwards on replay.
+        fabric_charge = None
+        if ctx.fabric is not None and self.net == "inter_node":
+            # Both waiters' NICs are charged to the COMMON barrier end_t (not
+            # the replay-adjusted local one) by the pending_completions drain,
+            # keyed on the gid so retries never double-charge (decision 1).
+            fabric_charge = (end_t, cost, self.size_bytes or 0)
         end_t = max(end_t, t["comp"], t["comm"])
         t["comp"] = t["comm"] = end_t
         self._batch_submit_by_gid.pop(gid, None)
         self._completed.add(gid)
-        ctx.pending_completions.append((gid, waiters, end_t, self.stream))
+        ctx.pending_completions.append((gid, waiters, end_t, self.stream, fabric_charge))
         return True, None
 
 
@@ -2597,13 +2711,18 @@ class send_prev(send):
 class async_send(LeafModel):
     simu_kind = "comm"
 
-    def __init__(self, id, fwd_cost=0, call_stk='', global_rank=None, stream="comm"):
+    def __init__(self, id, fwd_cost=0, call_stk='', global_rank=None, stream="comm",
+                 net=None, size_bytes=0):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
         self.id = id
         self.fwd_cost = fwd_cost
         self.global_rank = global_rank
         self.stream = stream
+        # Resolved strategy net name + payload size, forwarded into the posted
+        # entry's meta; None keeps the entry out of fabric charging.
+        self.net = net
+        self.size_bytes = size_bytes
         self._completed = set()
         self._entry_by_gid = {}
 
@@ -2623,6 +2742,8 @@ class async_send(LeafModel):
             mode="async_send",
             call_stk=self.call_stk,
             log_id=f"{phase}:{self.id}",
+            net=self.net,
+            size_bytes=self.size_bytes,
         )
         self._entry_by_gid[gid] = eid
         self._completed.add(gid)
@@ -2641,13 +2762,18 @@ class async_send(LeafModel):
 class async_recv(LeafModel):
     simu_kind = "comm"
 
-    def __init__(self, id, call_stk='', global_rank=None, stream="comm", fwd_cost=0):
+    def __init__(self, id, call_stk='', global_rank=None, stream="comm", fwd_cost=0,
+                 net=None, size_bytes=0):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
         self.id = id
         self.global_rank = global_rank
         self.stream = stream
         self.fwd_cost = fwd_cost
+        # Resolved strategy net name + payload size, forwarded into the posted
+        # entry's meta; None keeps the entry out of fabric charging.
+        self.net = net
+        self.size_bytes = size_bytes
         self._launched = set()
         self._entry_by_gid = {}
 
@@ -2666,6 +2792,8 @@ class async_recv(LeafModel):
             mode="async_recv",
             call_stk=self.call_stk,
             log_id=f"{phase}:{self.id}",
+            net=self.net,
+            size_bytes=self.size_bytes,
         )
         self._entry_by_gid[gid] = eid
         self._launched.add(gid)
@@ -2726,13 +2854,18 @@ class async_wait_recv(LeafModel):
     # declares the op's semantics (design doc 4.1: async_wait_recv -> wait).
     simu_kind = "wait"
 
-    def __init__(self, id, call_stk='', global_rank=None, stream="comm", fwd_cost=0):
+    def __init__(self, id, call_stk='', global_rank=None, stream="comm", fwd_cost=0,
+                 net=None, size_bytes=0):
         super().__init__()
         self.call_stk = call_stk + f'{self.call_stk}'
         self.id = id
         self.global_rank = global_rank
         self.stream = stream
         self.fwd_cost = fwd_cost
+        # Resolved strategy net name + payload size, forwarded into the posted
+        # entry's meta; None keeps the entry out of fabric charging.
+        self.net = net
+        self.size_bytes = size_bytes
         self._completed = set()
 
     def _step(self, t, ctx, phase="fwd"):
@@ -2773,6 +2906,8 @@ class async_wait_recv(LeafModel):
                 mode="async_recv",
                 call_stk=self._event_call_stk(),
                 log_id=f"fwd:{self.id}",
+                net=self.net,
+                size_bytes=self.size_bytes,
             )
             return False, ("yield_keep", gid)
         ok, blk = self._step(t, ctx, phase="fwd")
@@ -2794,6 +2929,8 @@ class async_wait_recv(LeafModel):
                 mode="async_recv",
                 call_stk=self._event_call_stk(),
                 log_id=f"bwd:{self.id}",
+                net=self.net,
+                size_bytes=self.size_bytes,
             )
             return False, ("yield_keep", gid)
         ok, blk = self._bwd(t, ctx)
@@ -2841,6 +2978,8 @@ class sync_send(async_send):
                 mode="sync_send",
                 call_stk=self.call_stk,
                 log_id=f"{phase}:{self.id}",
+                net=self.net,
+                size_bytes=self.size_bytes,
             )
             self._entry_by_gid[gid] = eid
         ready_t = ctx.ensure_async_ready(gid)
@@ -2887,6 +3026,8 @@ class sync_wait_recv(async_wait_recv):
                 mode="sync_recv",
                 call_stk=self._event_call_stk(),
                 log_id=f"{phase}:{self.id}",
+                net=self.net,
+                size_bytes=self.size_bytes,
             )
         ready_t = ctx.ensure_async_ready(gid)
         if ready_t is None:

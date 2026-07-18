@@ -7,7 +7,13 @@ import time
 import pickle
 from types import SimpleNamespace
 
-from simumax.core.base_struct import BarrierBackend, SimuContext, SimuSystem, SimuThread
+from simumax.core.base_struct import (
+    BarrierBackend,
+    NetworkFabric,
+    SimuContext,
+    SimuSystem,
+    SimuThread,
+)
 from simumax.core.generate_tracing import write_trace_file
 from simumax.core.simu_events import write_debug_log
 from simumax.core.simu_artifacts import (
@@ -36,6 +42,29 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
                       resource_lanes=resource_lanes)
     if should_enable_simu_memory_timeline(perf_model.strategy, perf_model._vp_size()):
         ctx.memory_tracker = SimuMemoryTracker()
+
+    # Network fabric servers (network-fabric design doc sections 5-6);
+    # None = off, which reproduces the current behavior.
+    fabric = None
+    model = getattr(perf_model.system, "fabric_model", None)
+    if model in ("nic", "nic+tor"):
+        topo = perf_model.system.topology or {}
+        share = topo.get("tor_node_share", "auto")
+        if share == "auto":
+            share = perf_model.system.num_per_node if merge_lanes else 1
+        # ToR capacity defaults to the node uplink (inter_node bandwidth);
+        # set topology.tor_capacity_gbps below that to model oversubscription.
+        tor_capacity = topo.get("tor_capacity_gbps")
+        if tor_capacity is None:
+            inter = perf_model.system.networks.get("inter_node")
+            tor_capacity = inter.bandwidth.gbps if inter is not None else None
+        fabric = NetworkFabric(
+            perf_model.system.num_per_node,
+            tor_enabled=(model == "nic+tor"),
+            tor_node_share=share,
+            tor_capacity_gbps=tor_capacity,
+        )
+    ctx.fabric = fabric
 
     if merge_lanes:
         simu_ranks = perf_model.strategy.pp_size

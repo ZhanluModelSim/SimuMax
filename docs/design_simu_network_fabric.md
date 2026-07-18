@@ -169,10 +169,21 @@ where a pure A/B (static corrections disabled) could be wired later.
 - ToR servers (reserved) need node-share amplification: with
   `merge_lanes=True`, 1 of `num_per_node` ranks per node is simulated, so
   a ToR server would only see 1/num_per_node of the node's real traffic.
-  The reserved model: each entry records `meta["node_share"]`
-  (≈ `num_per_node` for merge_lanes, 1 otherwise); when ToR is activated,
-  its occupancy charge is `cost * node_share`. ToR capacity defaults to
-  `inter_node.gbps` (the node uplink) and is overridable in `topology`.
+  The reserved model: `tor_node_share` (≈ `num_per_node` for merge_lanes,
+  1 otherwise) amplifies each entry's ToR occupancy. The occupancy is
+  `size_bytes / tor_capacity * node_share` (fallback
+  `cost * node_share / num_per_node` when size/capacity are missing).
+  ToR capacity defaults to `inter_node.gbps` (the node uplink), so with
+  the default share the ToR occupancy equals the per-NIC service time
+  and ToR never binds harder than the NIC for isomorphic node traffic;
+  it only binds when `topology.tor_capacity_gbps` models oversubscription.
+  (An earlier draft charged `cost * node_share` — that implicitly set the
+  uplink equal to one NIC and was ~num_per_node x too pessimistic, as
+  shown by the 16384-GPU A/B; the size-based formula above is the
+  physically consistent one.) Caveat: `size_bytes` is the raw message
+  size, so ops whose cost applies a cross-node traffic fraction
+  (all2all `(k-1)/k`) are charged at ToR with their full size — a
+  slight overcharge, accepted as a Preview limitation.
 - PP p2p between stages maps both endpoints through the existing
   representative-rank mapping; `default_group` stays a pure barrier.
 
