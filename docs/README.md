@@ -70,3 +70,7 @@ Recommended order:
   ([中文版本](./design_simu_kind_resource_model-zh.md)) — explicit
   `simu_kind` operator classification, resource/engine lane model, and
   extensible fused-op support for the `simulate()` DES path.
+- [design_simu_network_fabric.md](./design_simu_network_fabric.md)
+  ([中文版本](./design_simu_network_fabric-zh.md)) — per-GPU NIC
+  contention, both-end p2p charging, and topology-aware cost corrections
+  for cross-node communication in the DES.
