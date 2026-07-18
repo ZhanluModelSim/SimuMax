@@ -5,7 +5,10 @@
 
 # Design Proposal: Network Fabric Modeling for the DES
 
-- Status: **Draft v0.1** (design agreed in discussion, not yet implemented)
+- Status: **v1.0 (Phases A-C implemented)** — Phase C landed per user
+  request though originally marked reserved.
+- Implementation: phase A `73dbd93`, phase B `6d3a515` (incl. the ToR
+  occupancy formula fix), phase C `99c8670`.
 - Date: 2026-07-17
 - Scope: `simulate()` DES path — collective/p2p communication timing under
   cross-node traffic. Builds on the resource-lane and simu_kind groundwork

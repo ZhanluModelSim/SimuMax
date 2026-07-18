@@ -5,7 +5,10 @@
 
 # 设计方案：DES 网络 fabric 建模
 
-- 状态：**草案 v0.1**（讨论已定稿，尚未实现）
+- 状态：**v1.0（Phase A-C 已实现）**——Phase C 原标注为预留，按用户
+  要求一并实施。
+- 实现记录：phase A `73dbd93`，phase B `6d3a515`（含 ToR 占用公式
+  修正），phase C `99c8670`。
 - 日期：2026-07-17
 - 范围：`simulate()` DES 路径——跨节点流量下集合通信/p2p 的计时。
   建立在 `design_simu_kind_resource_model.md` 的资源 lane 与
