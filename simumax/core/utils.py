@@ -248,6 +248,63 @@ def get_rank_group(global_rank, strategy):
     }
     return dic
 
+
+# --- Group -> node mapping (design_simu_network_fabric.md, Tier A) ---
+#
+# Members of a single-dimension group form an arithmetic progression
+# `base + k*stride` in the rank mesh (dense order tp-cp-dp-pp, MoE order
+# ep-etp-edp-pp). The node count and cross-node traffic ratio of any
+# collective therefore follow in O(1) from (group_size, stride).
+def _group_size_and_stride(group_kind, strategy):
+    """Return (group_size, member_stride) for a parallelism group kind."""
+    if group_kind == "tp":
+        return strategy.tp_size, 1
+    if group_kind == "cp":
+        return strategy.cp_size, strategy.tp_size
+    if group_kind == "dp":
+        return strategy.dp_size, strategy.tp_size * strategy.cp_size
+    if group_kind == "dp_cp":
+        return strategy.dp_size * strategy.cp_size, strategy.tp_size
+    if group_kind == "pp":
+        return strategy.pp_size, strategy.tp_size * strategy.cp_size * strategy.dp_size
+    if group_kind == "ep":
+        return strategy.ep_size, 1
+    if group_kind == "etp":
+        return strategy.etp_size, strategy.ep_size
+    if group_kind == "edp":
+        return strategy.edp_size, strategy.ep_size * strategy.etp_size
+    raise ValueError(f"unknown group_kind: {group_kind!r}")
+
+
+def group_node_stats(group_kind, strategy, num_per_node):
+    """Return (group_size, node_count) spanned by a parallelism group.
+
+    The first member is assumed node-aligned (rank 0 convention, matching
+    the legacy ceil-based heuristics). With stride >= num_per_node every
+    member sits on its own node; with stride < num_per_node members are
+    packed contiguously so no intermediate node is skipped.
+    """
+    group_size, stride = _group_size_and_stride(group_kind, strategy)
+    if group_size <= 1 or num_per_node <= 1:
+        return group_size, 1
+    if stride >= num_per_node:
+        return group_size, group_size
+    node_count = (group_size - 1) * stride // num_per_node + 1
+    return group_size, node_count
+
+
+def group_cross_node_ratio(group_kind, strategy, num_per_node):
+    """Fraction of a collective's traffic that crosses node boundaries.
+
+    Mirrors the legacy (k-1)/k convention but with the real node count:
+    0.0 when the group fits in one node, (nodes-1)/nodes otherwise.
+    """
+    _, node_count = group_node_stats(group_kind, strategy, num_per_node)
+    if node_count <= 1:
+        return 0.0
+    return (node_count - 1) / node_count
+
+
 def merge_dict(cur_data, merges_data):
     if len(merges_data) == 0:
         for key, value in cur_data.items():

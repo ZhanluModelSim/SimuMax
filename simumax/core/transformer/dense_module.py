@@ -48,6 +48,8 @@ class Embedding(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="Embedding"                
             )
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
@@ -64,6 +66,8 @@ class Embedding(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="Embedding" 
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
@@ -110,6 +114,8 @@ class Embedding(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="Embedding"
             )
 
@@ -124,6 +130,8 @@ class Embedding(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="Embedding"
             )
 
@@ -249,6 +257,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             )
             self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
@@ -265,6 +275,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
@@ -285,6 +297,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             )
             self.layers.append(all_gather_bwd(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
@@ -363,6 +377,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearCol_FWD_SP"
             )
 
@@ -385,6 +401,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearCol_BWD_ACT_SP"
             )
         elif self.strategy.tp_size > 1:
@@ -397,6 +415,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearCol_BWD_ACT_TP"
             )
         # 4.Bwd weight
@@ -411,6 +431,8 @@ class LinearCol(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearCol_BWD_W_SP"
 
             )
@@ -567,6 +589,8 @@ class LinearRow(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             )
             
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
@@ -583,6 +607,8 @@ class LinearRow(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size,  com_buff=com_buff,
@@ -656,6 +682,8 @@ class LinearRow(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearROW_FWD_SP"
             )
 
@@ -669,6 +697,8 @@ class LinearRow(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearROW_FWD_TP"
             )
 
@@ -688,6 +718,8 @@ class LinearRow(LinearBase):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="LinearROW_BWD_SP"
             )
         else:
@@ -1205,6 +1237,8 @@ class CoreAttention(MetaModule):
                 comm_size,
                 comm_num=self.strategy.cp_size,
                 net=self.strategy.cp_net,
+                strategy=self.strategy,
+                group_kind="cp",
                 comm_stage=stage_name,
             )
             fwd_cost = cost if comm_cls is all2all_fwd else 0
@@ -1367,6 +1401,8 @@ class CoreAttention(MetaModule):
                                 comm_size,
                                 comm_num=self.strategy.cp_size,
                                 net=self.strategy.cp_net,
+                                strategy=self.strategy,
+                                group_kind="cp",
                                 comm_stage=stage_name,
                             ),
                         )
@@ -1381,6 +1417,8 @@ class CoreAttention(MetaModule):
                     fwd_comm_size,
                     comm_num=self.strategy.cp_size,
                     net=self.strategy.cp_net,
+                    strategy=self.strategy,
+                    group_kind="cp",
                     comm_stage="Attention_FWD_CP"
                 )
                 # 2. backward ag x1 + ag x 1
@@ -1391,6 +1429,8 @@ class CoreAttention(MetaModule):
                     bwd_comm_size1,
                     comm_num=self.strategy.cp_size,
                     net=self.strategy.cp_net,
+                    strategy=self.strategy,
+                    group_kind="cp",
                     comm_stage="Attention_BWD_CP1"
                 )
                 self._cost_info.bwd_net_time += self.system.compute_net_op_time( 
@@ -1398,6 +1438,8 @@ class CoreAttention(MetaModule):
                     bwd_comm_size2,
                     comm_num=self.strategy.cp_size,
                     net=self.strategy.cp_net,
+                    strategy=self.strategy,
+                    group_kind="cp",
                     comm_stage="Attention_BWD_CP2"
                 )
             else:
@@ -2127,6 +2169,8 @@ class ParallelCE(MetaModule):
             comm_size1,
             comm_num=self.strategy.tp_size,
             net=self.strategy.tp_net,
+            strategy=self.strategy,
+            group_kind="tp",
         )
 
         cost2 = self.system.compute_net_op_time(
@@ -2134,6 +2178,8 @@ class ParallelCE(MetaModule):
             comm_size2,
             comm_num=self.strategy.tp_size,
             net=self.strategy.tp_net,
+            strategy=self.strategy,
+            group_kind="tp",
         )
         # comm_size = "B*S"
         self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
@@ -2148,6 +2194,8 @@ class ParallelCE(MetaModule):
                 comm_size2 * 2,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                     rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
@@ -2184,6 +2232,8 @@ class ParallelCE(MetaModule):
                 scalar_comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
                 comm_stage="ParallelCE_FWD_TP"
             )
             if self.strategy.cross_entropy_loss_fusion:
@@ -2194,6 +2244,8 @@ class ParallelCE(MetaModule):
                     logits_comm_size + scalar_comm_size,
                     comm_num=self.strategy.tp_size,
                     net=self.strategy.tp_net,
+                    strategy=self.strategy,
+                    group_kind="tp",
                     comm_stage="ParallelCE_FWD_TP"
                 )
             else:
@@ -2203,6 +2255,8 @@ class ParallelCE(MetaModule):
                     logits_comm_size,
                     comm_num=self.strategy.tp_size,
                     net=self.strategy.tp_net,
+                    strategy=self.strategy,
+                    group_kind="tp",
                     comm_stage="ParallelCE_FWD_TP"
                 )
                 # all_reduce for sum_exp_logits [B x S]
@@ -2211,6 +2265,8 @@ class ParallelCE(MetaModule):
                     scalar_comm_size,
                     comm_num=self.strategy.tp_size,
                     net=self.strategy.tp_net,
+                    strategy=self.strategy,
+                    group_kind="tp",
                     comm_stage="ParallelCE_FWD_TP"
                 )
 

@@ -302,6 +302,8 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             ) 
             self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
@@ -434,6 +436,8 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.etp_size,
                 net=self.strategy.etp_net,
+                strategy=self.strategy,
+                group_kind="etp",
                 comm_stage="Permutation_FWD_ETP"
             )
             # bwd
@@ -442,6 +446,8 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.etp_size,
                 net=self.strategy.etp_net,
+                strategy=self.strategy,
+                group_kind="etp",
                 comm_stage="Permutation_BWD_ETP"
             )
         if self.enable_recompute:
@@ -605,6 +611,8 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
+                strategy=self.strategy,
+                group_kind="tp",
             ) 
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
@@ -694,6 +702,8 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.etp_size,
                 net=self.strategy.etp_net,
+                strategy=self.strategy,
+                group_kind="etp",
                 comm_stage="Combine_FWD_ETP"
             )
             self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
@@ -701,6 +711,8 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.etp_size,
                 net=self.strategy.etp_net,
+                strategy=self.strategy,
+                group_kind="etp",
                 comm_stage="Combine_BWD_ETP"
             )
 

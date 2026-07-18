@@ -10,7 +10,7 @@ import math
 import warnings
 import re
 
-from simumax.core.utils import to_json_string
+from simumax.core.utils import to_json_string, group_cross_node_ratio
 from simumax.core.fusion import FUSION_POLICIES, build_fusion_policy
 
 capture_graph_only = False
@@ -970,10 +970,17 @@ class SystemConfig(Config):
                 return values[key]
         return default
 
-    def compute_net_op_time(self, op_name: str, size: int, comm_num: int, net="", comm_stage="unkonw", strategy:StrategyConfig=None):
+    def compute_net_op_time(self, op_name: str, size: int, comm_num: int, net="", comm_stage="unkonw", strategy:StrategyConfig=None, group_kind: str = None):
         """
         compute network operation time,
         return time in ms
+
+        Inter-node corrections follow Tier A of
+        docs/design_simu_network_fabric.md: when `strategy` (and, for
+        TP/CP/ETP collectives, `group_kind`) is provided, cross-node
+        traffic ratios come from the real group->node mapping
+        (`simumax.core.utils.group_cross_node_ratio`). Calls that pass no
+        `strategy`/`group_kind` keep the legacy heuristics unchanged.
         """
         # Using ring alg for now
         assert op_name in kNetOp, f"{op_name} not exist on {kNetOp}"
@@ -1028,12 +1035,27 @@ class SystemConfig(Config):
                 elif "cp" in comm_stage.lower(): 
                     # Similar to ep all2all: when cp spans multiple nodes, only cross-node
                     # traffic contributes to inter-node transfer and each group is limited by one NIC.
-                    k = max(1, math.ceil(comm_num / self.num_per_node))
-                    actual_size = (k - 1) / k * actual_size
+                    if strategy is not None:
+                        # Tier A (docs/design_simu_network_fabric.md, section 4):
+                        # use the real cross-node ratio from the cp group's
+                        # arithmetic-progression mesh math; the legacy ceil-based
+                        # (k-1)/k is wrong for non-contiguous strides (e.g. cp
+                        # with tp=8 spans 2 nodes -> real ratio 0.5, legacy k=1 -> 0).
+                        actual_size = group_cross_node_ratio("cp", strategy, self.num_per_node) * actual_size
+                    else:
+                        k = max(1, math.ceil(comm_num / self.num_per_node))
+                        actual_size = (k - 1) / k * actual_size
                     bw /= self.num_per_node
             
             # 3. tp+sp & ag cp & dp
             if op_name in ["all_reduce", "all_gather", "reduce_scatter"]:
+                # Tier A (docs/design_simu_network_fabric.md, section 4):
+                # TP/CP/ETP collectives assigned to inter_node previously got
+                # no cross-node correction at all; scale the payload by the
+                # real cross-node ratio of the group. Purely additive — the
+                # dp/dp_cp/edp NIC-contention divisions below are unchanged.
+                if group_kind in ("tp", "cp", "etp") and strategy is not None:
+                    actual_size *= group_cross_node_ratio(group_kind, strategy, self.num_per_node)
                 if strategy is not None: 
                     if is_dense_dp_stage:
                         # zero0: all_reduce 
