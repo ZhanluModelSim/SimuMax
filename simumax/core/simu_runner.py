@@ -40,6 +40,10 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     output_json_path = os.path.join(save_path, "tracing_logs.json")
     ctx = SimuContext(BarrierBackend(), merge_lanes=merge_lanes, log_path=log_path,
                       resource_lanes=resource_lanes)
+    # Phase C virtual waiters (network-fabric design doc section 8)
+    ctx.collective_skew = getattr(perf_model.strategy, "collective_skew", None)
+    ctx.strategy = perf_model.strategy
+    ctx.num_per_node = perf_model.system.num_per_node
     if should_enable_simu_memory_timeline(perf_model.strategy, perf_model._vp_size()):
         ctx.memory_tracker = SimuMemoryTracker()
 

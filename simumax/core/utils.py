@@ -1,6 +1,7 @@
 """Various utilities"""
 
 import json
+import math
 import os, subprocess
 
 
@@ -303,6 +304,54 @@ def group_cross_node_ratio(group_kind, strategy, num_per_node):
     if node_count <= 1:
         return 0.0
     return (node_count - 1) / node_count
+
+
+# --- Machine-level straggler model (design_simu_network_fabric.md, Phase C) ---
+#
+# Shared by the analytical path (PerfLLM, gated by
+# strategy.enable_straggler_model) and the DES "virtual waiters" collective
+# skew (strategy.collective_skew). Kept next to the group->node helpers
+# above since both quantify node-granularity effects.
+STRAGGLER_BASE_FACTOR = 0.09
+
+
+def get_effective_straggler_sample_count(
+    world_size: int,
+    num_per_node: int,
+    dp_size: int,
+    edp_size: int,
+) -> int:
+    """Estimate the number of independent machine-level straggler samples.
+
+    SimuMax assumes GPUs on the same node are performance-stable, while node-to-
+    node runtime can fluctuate. Under that assumption, the effective sample
+    count should be limited by:
+
+    - how many nodes are present
+    - how many dense-DP replicas are active
+    - how many expert-DP replicas are active
+
+    Using min(node_count, dp_size, edp_size) keeps single-node and small-scale
+    runs from exaggerating straggler inflation.
+    """
+
+    safe_num_per_node = max(1, int(num_per_node))
+    node_count = max(1, math.ceil(int(world_size) / safe_num_per_node))
+    return max(1, min(node_count, int(dp_size), int(edp_size)))
+
+
+def estimate_straggler_increase_ratio(worker_count: int) -> float:
+    """Empirical machine-level straggler inflation ratio.
+
+    The formula preserves the expected sqrt(log n) growth of the maximum over
+    many machines, while damping small-n behavior to match local simulations.
+    """
+
+    n = max(1, int(worker_count))
+    if n <= 1:
+        return 1.0
+    n_straggler = math.log2(n)
+    return 1.0 + n_straggler / (n_straggler + 1.0) * STRAGGLER_BASE_FACTOR * math.sqrt(n_straggler)
 
 
 def merge_dict(cur_data, merges_data):

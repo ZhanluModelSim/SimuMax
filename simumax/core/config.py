@@ -249,6 +249,11 @@ class StrategyConfig(Config):
     microbatch_group_size_per_vp_stage: Optional[int] = None
     pp_comm_async: bool = True
     enable_straggler_model: bool = True
+    # DES-side collective skew switch (network-fabric design doc section 8,
+    # Phase C). enable_straggler_model scales the analytical run_estimate()
+    # result; collective_skew instead skews local collectives inside the
+    # simulate() DES path and leaves the analytical estimate untouched.
+    collective_skew: Optional[str] = None
     zero_state: int = 1
 
     attention_sparse_ratio: float = (
@@ -329,6 +334,9 @@ class StrategyConfig(Config):
     valid_cp_a2a_modes = [
         "async_cp",
         "sync_cp",
+    ]
+    valid_collective_skew = [
+        "virtual_waiters",
     ]
     valid_fused_mem_modes = [
         "steady_state",
@@ -611,6 +619,9 @@ class StrategyConfig(Config):
             raise ValueError(f"Invalid order_of_paralielism, we only support tp-cp-ep-dp-pp now, but got {self.order_of_paralielism}")
         assert self.cp_a2a_mode in self.valid_cp_a2a_modes, (
             f"cp_a2a_mode {self.cp_a2a_mode} must be in [{','.join(self.valid_cp_a2a_modes)}]"
+        )
+        assert self.collective_skew is None or self.collective_skew in self.valid_collective_skew, (
+            f"collective_skew {self.collective_skew} must be None or in [{','.join(self.valid_collective_skew)}]"
         )
         if self.cache_groupgemm_col_fp8_inputs:
             assert self.fp8, "cache_groupgemm_col_fp8_inputs requires fp8"

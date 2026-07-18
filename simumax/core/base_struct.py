@@ -33,6 +33,7 @@ from simumax.core.fusion import FusionPolicy
 from simumax.core.simu_memory import OpMemoryProfile
 from simumax.core.utils import get_point_name, to_json_string
 from simumax.core.utils import get_rank_group
+from simumax.core.utils import group_node_stats, estimate_straggler_increase_ratio
 from simumax.core.graph import SimuONNXGraphBuilder
 
 class FwdQue:
@@ -1650,6 +1651,24 @@ class SimuSystem:
         print(f'end in {end_t}')
         return end_t
 
+# Phase C "virtual waiters" (network-fabric design doc section 8): collective
+# group kinds recognized in comm ids, as (marker, group_kind) pairs. Ordering
+# matters — "dp_cp_group:" must be tried before "cp_group:" because the latter
+# is a substring of the former. Ids look like
+# "7-Embedding-tp_group:pp:0-cp:0-dp:0", so match with `in`.
+_SKEW_GROUP_KINDS = (("dp_cp_group:", "dp_cp"), ("edp_group:", "edp"),
+                     ("ep_group:", "ep"), ("cp_group:", "cp"),
+                     ("tp_group:", "tp"), ("pp_group:", "pp"))
+
+
+def _parse_group_kind(id_str):
+    """Group kind encoded in a comm id; None when not a collective group."""
+    for marker, kind in _SKEW_GROUP_KINDS:
+        if marker in id_str:
+            return kind
+    return None
+
+
 class SimuContext:
     def __init__(self, backend, merge_lanes=True, log_path='./tmp/log.log', sync_lanes=False,
                  resource_lanes=None, fabric=None):
@@ -2009,6 +2028,19 @@ class SimuContext:
         if self.fabric is not None and entry.meta.get("net") == "inter_node":
             launch_t = self.fabric.acquire(rank, launch_t)
         end_t = launch_t + entry.cost
+        # Phase C "virtual waiters" (network-fabric design doc section 8): a
+        # local collective really completes when the slowest member of its
+        # group arrives, so inflate its duration by the analytical straggler
+        # ratio of the group's node count. p2p and rendezvous entries sync
+        # with real peers and never pass through here, so they are never
+        # skewed. Off by default; the skewed end_t flows downstream exactly
+        # like the legacy one (lane tail, fabric charge, event end).
+        if getattr(self, "collective_skew", None) == "virtual_waiters":
+            strategy = getattr(self, "strategy", None)
+            kind = _parse_group_kind(entry.gid[1])
+            if strategy is not None and kind is not None:
+                nodes = group_node_stats(kind, strategy, self.num_per_node)[1]
+                end_t = launch_t + entry.cost * estimate_straggler_increase_ratio(nodes)
         self._complete_comm_entry(eid, launch_t, end_t)
 
     def _pump_rendezvous_entry(self, eid):

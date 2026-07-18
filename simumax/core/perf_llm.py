@@ -28,6 +28,9 @@ from simumax.core.utils import (
     convert_final_result_to_human_format,
     get_pp_stage_representative_rank,
     get_pp_p2p_comm_size,
+    get_effective_straggler_sample_count,
+    estimate_straggler_increase_ratio,
+    STRAGGLER_BASE_FACTOR,
     merge_dict,
     rm_tmp
 )
@@ -35,7 +38,6 @@ from simumax.core.utils import (
 FIRST_CHUNK = "first_stage_chunk"
 MIDDLE_CHUNK = "middle_stage_chunk"
 LAST_CHUNK = "last_stage_chunk"
-STRAGGLER_BASE_FACTOR = 0.09
 
 
 # Search-only caches should be keyed by every strategy field that can change a
@@ -251,44 +253,6 @@ _LLM_CHUNK_PROFILE_CACHE: Dict[Tuple, Tuple[CachedChunkProfile, PeakPoint]] = {}
 _LLM_UNIT_RUNTIME_PROFILE_CACHE: Dict[Tuple, CachedUnitRuntimeProfile] = {}
 _LLM_UNIT_MODEL_PROFILE_CACHE: Dict[Tuple, CachedUnitModelProfile] = {}
 
-
-def get_effective_straggler_sample_count(
-    world_size: int,
-    num_per_node: int,
-    dp_size: int,
-    edp_size: int,
-) -> int:
-    """Estimate the number of independent machine-level straggler samples.
-
-    SimuMax assumes GPUs on the same node are performance-stable, while node-to-
-    node runtime can fluctuate. Under that assumption, the effective sample
-    count should be limited by:
-
-    - how many nodes are present
-    - how many dense-DP replicas are active
-    - how many expert-DP replicas are active
-
-    Using min(node_count, dp_size, edp_size) keeps single-node and small-scale
-    runs from exaggerating straggler inflation.
-    """
-
-    safe_num_per_node = max(1, int(num_per_node))
-    node_count = max(1, math.ceil(int(world_size) / safe_num_per_node))
-    return max(1, min(node_count, int(dp_size), int(edp_size)))
-
-
-def estimate_straggler_increase_ratio(worker_count: int) -> float:
-    """Empirical machine-level straggler inflation ratio.
-
-    The formula preserves the expected sqrt(log n) growth of the maximum over
-    many machines, while damping small-n behavior to match local simulations.
-    """
-
-    n = max(1, int(worker_count))
-    if n <= 1:
-        return 1.0
-    n_straggler = math.log2(n)
-    return 1.0 + n_straggler / (n_straggler + 1.0) * STRAGGLER_BASE_FACTOR * math.sqrt(n_straggler)
 
 class PerfBase(ABC):
     """

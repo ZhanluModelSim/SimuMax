@@ -281,3 +281,12 @@ Megatron-LM 相关参数，用来决定 MoE 里 probs 的归属口径。
 融合算子的显存记账模式。`"steady_state"`（默认）在算子开始时按闭式
 稳态峰值记账。`"ramp"` 为忠实的逐 chunk 爬升曲线预留，目前会告警并
 回退到 `"steady_state"`。
+
+### collective_skew
+DES 中本地集合通信的跨 rank skew 模型（见
+[design_simu_network_fabric-zh.md](./design_simu_network_fabric-zh.md) 第 8
+节 Phase C）。默认 `None` 表示关闭。`"virtual_waiters"` 会按
+`estimate_straggler_increase_ratio(集合通信 group 的节点数)`
+放大每个本地集合通信的完成时间——确定性的、节点粒度的 skew。它只影响
+DES `simulate()` 路径；而 `enable_straggler_model` 缩放的是解析估计
+`run_estimate()` 的结果。

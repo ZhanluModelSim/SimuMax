@@ -292,3 +292,13 @@ Memory accounting mode for fused ops. `"steady_state"` (default) books the
 closed-form steady-state peak at op start. `"ramp"` is reserved for the
 faithful per-chunk ramp curve and currently falls back to `"steady_state"`
 with a warning.
+
+### collective_skew
+Cross-rank skew model for local collectives in the DES (see
+[design_simu_network_fabric.md](./design_simu_network_fabric.md), section 8
+Phase C). Default `None` means off. `"virtual_waiters"` inflates each local
+collective's completion by
+`estimate_straggler_increase_ratio(node_count of the collective's group)` —
+a deterministic, node-granularity skew. It only affects the DES
+`simulate()` path, unlike `enable_straggler_model` which scales the
+analytical `run_estimate()` result.
