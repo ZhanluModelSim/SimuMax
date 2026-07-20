@@ -5,7 +5,8 @@
 
 # Design Proposal: Workload Ingestion & Per-Operator Cost-Model Tunability
 
-- Status: **Draft v0.1** (design agreed in discussion, not yet implemented)
+- Status: **v1.0 (Phases 1-3 implemented)**
+- Implementation: phase 1 `0463810`, phase 2 `ced8835`, phase 3 `TBD`
 - Date: 2026-07-17
 - Scope: the analytical cost path (`compute_op_accuracy_time`,
   `_comp_cost_info_impl`), module cost specs, model JSON composition,
@@ -189,6 +190,11 @@ existing module classes — the recipe generalizes the current
 recipe). Custom attention/MLP variants beyond the registered templates
 still require Python modules, but the common "N blocks + dense prefix"
 family becomes JSON-only.
+
+In the v1 implementation the recipe templates cover the Dense/MoE block
+families (`DenseLLMBlock` / `MoELLMBlock`) and expand into the existing
+`layer_num` / `dense_layers` fields, while relocating the cost formulas
+themselves into `CostSpec` remains future work.
 
 ## 7. Measurement Feedback Loop
 

@@ -5,7 +5,8 @@
 
 # 设计方案：负载接入与算子级成本模型独立可调
 
-- 状态：**草案 v0.1**（讨论已定稿，尚未实现）
+- 状态：**v1.0（Phase 1-3 已实现）**
+- 实现记录：phase 1 `0463810`，phase 2 `ced8835`，phase 3 `TBD`
 - 日期：2026-07-17
 - 范围：解析成本路径（`compute_op_accuracy_time`、
   `_comp_cost_info_impl`）、模块成本规格、model JSON 组合方式、测量
@@ -166,6 +167,10 @@ no-op）。
 `dense_layers` + `layer_num` 模式的泛化（该模式成为隐式默认配
 方）。超出已注册模板的自定义注意力/MLP 仍需 Python 模块，但常见
 的"N 个 block + dense 前缀"家族变为纯 JSON 接入。
+
+v1 实现中，配方模板覆盖 Dense/MoE block 家族（`DenseLLMBlock` /
+`MoELLMBlock`），并展开为现有 `layer_num` / `dense_layers` 字段；
+成本公式本身搬入 `CostSpec` 仍是后续工作。
 
 ## 7. 测量回灌闭环
 

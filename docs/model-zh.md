@@ -134,6 +134,46 @@ MoE / MLA 用户建议重点检查：
   - `q_lora_rank`
   - `kv_lora_rank`
 
+## recipe（可选）
+
+可选的层组合声明（
+[design_simu_cost_model_tunability-zh.md](./design_simu_cost_model_tunability-zh.md)
+Phase 3）。model JSON 可以不再只依赖 `layer_num` / `dense_layers`，
+而是用已注册模板声明 block 堆叠：
+
+```json
+"recipe": {
+    "blocks": [
+        {"template": "DenseLLMBlock", "count": 3},
+        {"template": "MoELLMBlock", "count": 58}
+    ]
+}
+```
+
+v1 模板：
+
+| 模板 | block 家族 |
+|---|---|
+| `DenseLLMBlock` | dense transformer 层 |
+| `MoELLMBlock` | MoE transformer 层 |
+
+展开与校验规则：
+
+- `layer_num` 取所有 block `count` 之和；`dense_layers` 取前缀
+  `DenseLLMBlock` 的数量。
+- Dense block 必须构成前缀：`MoELLMBlock` 之后再出现
+  `DenseLLMBlock` 会触发校验错误。
+- 当 `recipe` 与显式的 `layer_num` / `dense_layers` 冲突时，以
+  recipe 为准并打印 warning。
+- 不配置 `recipe` 时行为不变——现有 `layer_num` + `dense_layers`
+  模式即隐式默认配方。
+
+模板注册在 cost spec 注册表（`simumax/core/cost_specs.py`）中，注册表
+把每个模板映射到其 block 家族与算子绑定；成本公式本身搬入注册表是
+文档记录的后续工作。可运行示例见
+[configs/models/llama2-tiny-recipe.json](../configs/models/llama2-tiny-recipe.json)——
+用 recipe 表达的 `llama2-tiny`。
+
 ## 词表 padding
 
 与 Megatron 对齐时，词表 padding 相关字段包括：

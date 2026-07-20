@@ -12,6 +12,7 @@ import re
 
 from simumax.core.utils import to_json_string, group_cross_node_ratio
 from simumax.core.fusion import FUSION_POLICIES, build_fusion_policy
+from simumax.core.cost_specs import get_block_template
 
 capture_graph_only = False
 ENABLE_SIMU_GRAPH = int(os.environ.get("ENABLE_SIMU_GRAPH", "0"))
@@ -1499,6 +1500,10 @@ class ModelConfig(Config):
     moe_pad_expert_input_to_capacity:bool = True
     capacity:int = 1
     group_linear_mode:str = "parallel"
+    # Declarative block recipe (cost-tunability design doc section 6): an
+    # optional {"blocks": [{"template": <name>, "count": <int>}, ...]}
+    # composition, expanded into layer_num / dense_layers by apply_recipe().
+    recipe: Optional[Dict[str, Any]] = None
     make_vocab_size_divisible_by = 128 # default is 128 in megatron
     padded_vocab_size = True # When tokinzer is NullTokenizer, pad vocab size to make it divisible by make_vocab_size_divisible_by * tp_size in Megatron
     
@@ -1653,7 +1658,74 @@ class ModelConfig(Config):
             + factor * self.mlp_elements
         )
 
+    def apply_recipe(self):
+        """Expand the optional declarative block recipe (design doc section 6).
+
+        v1 supports a flat "blocks" list over the registered BLOCK_TEMPLATES.
+        The current LLMModel only supports a dense prefix, so DenseLLMBlock
+        entries must lead; a dense block after a MoE block is an error. The
+        recipe expands into layer_num (sum of counts) and dense_layers (sum
+        of the leading dense counts), which win over explicitly set
+        conflicting values (with a warning). Absent a recipe, nothing changes.
+        """
+        if self.recipe is None:
+            return
+        assert isinstance(self.recipe, dict), (
+            f"recipe must be a dict, but got {type(self.recipe)}"
+        )
+        unknown_keys = set(self.recipe) - {"blocks"}
+        assert not unknown_keys, (
+            f"recipe has unknown keys {sorted(unknown_keys)}, "
+            "allowed keys are ['blocks']"
+        )
+        blocks = self.recipe.get("blocks")
+        assert isinstance(blocks, list) and blocks, (
+            "recipe['blocks'] must be a non-empty list of "
+            "{'template': <name>, 'count': <int>=1} entries"
+        )
+        layer_num = 0
+        dense_layers = 0
+        seen_moe = False
+        for i, block in enumerate(blocks):
+            ctx = f"recipe['blocks'][{i}]"
+            assert isinstance(block, dict), (
+                f"{ctx} must be a dict, but got {type(block)}"
+            )
+            assert set(block) == {"template", "count"}, (
+                f"{ctx} must have exactly the keys ['template', 'count'], "
+                f"but got {sorted(block)}"
+            )
+            template = get_block_template(block["template"])
+            count = block["count"]
+            assert (
+                isinstance(count, int) and not isinstance(count, bool) and count >= 1
+            ), f"{ctx}['count'] must be an int >= 1, but got {count!r}"
+            layer_num += count
+            if template.family == "moe":
+                seen_moe = True
+            else:
+                assert not seen_moe, (
+                    f"{ctx}: dense blocks must lead the recipe; a "
+                    "DenseLLMBlock after a MoELLMBlock is not supported "
+                    "(LLMModel only supports a dense prefix)"
+                )
+                dense_layers += count
+        if self.layer_num is not None and self.layer_num != layer_num:
+            warnings.warn(
+                f"recipe expands to layer_num={layer_num}, but layer_num="
+                f"{self.layer_num} was also set explicitly; the recipe wins."
+            )
+        if self.dense_layers and self.dense_layers != dense_layers:
+            warnings.warn(
+                f"recipe expands to dense_layers={dense_layers}, but "
+                f"dense_layers={self.dense_layers} was also set explicitly; "
+                "the recipe wins."
+            )
+        self.layer_num = layer_num
+        self.dense_layers = dense_layers
+
     def sanity_check(self):
+        self.apply_recipe()
         if not self.v_head_dim: 
             # not used for MLA
             # assert self.head_num * self.head_size == self.hidden_size

@@ -131,6 +131,48 @@ MoE / MLA checklist:
   - `q_lora_rank`
   - `kv_lora_rank`
 
+## recipe (optional)
+
+Optional layer-composition declaration (Phase 3 of
+[design_simu_cost_model_tunability.md](./design_simu_cost_model_tunability.md)).
+Instead of relying only on `layer_num` / `dense_layers`, a model JSON may
+declare its block stack from registered templates:
+
+```json
+"recipe": {
+    "blocks": [
+        {"template": "DenseLLMBlock", "count": 3},
+        {"template": "MoELLMBlock", "count": 58}
+    ]
+}
+```
+
+v1 templates:
+
+| Template | Block family |
+|---|---|
+| `DenseLLMBlock` | dense transformer layer |
+| `MoELLMBlock` | MoE transformer layer |
+
+Expansion and validation rules:
+
+- `layer_num` becomes the sum of all block `count` values; `dense_layers`
+  becomes the count of the leading `DenseLLMBlock` run.
+- Dense blocks must form a prefix: a `DenseLLMBlock` entry after a
+  `MoELLMBlock` entry is a validation error.
+- If `recipe` conflicts with explicit `layer_num` / `dense_layers`, the
+  recipe wins and a warning is logged.
+- If `recipe` is absent, behavior is unchanged — the existing
+  `layer_num` + `dense_layers` pattern acts as the implicit default
+  recipe.
+
+Templates are registered in the cost-spec registry
+(`simumax/core/cost_specs.py`), which maps each template to its block
+family and op bindings; relocating the cost formulas themselves into the
+registry is documented future work. A runnable demo is
+[configs/models/llama2-tiny-recipe.json](../configs/models/llama2-tiny-recipe.json),
+which expresses `llama2-tiny` as a recipe.
+
 ## Vocabulary Padding
 
 Megatron-style vocabulary padding is modeled with:
