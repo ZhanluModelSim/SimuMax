@@ -78,3 +78,7 @@ Recommended order:
   ([中文版本](./design_simu_cost_model_tunability-zh.md)) — per-operator
   efficiency keys (class + path), declarative model recipe, and
   non-GEMM shape dimensions for the cost model.
+- [design_simu_hierarchical_network.md](./design_simu_hierarchical_network.md)
+  ([中文版本](./design_simu_hierarchical_network-zh.md)) — multi-level
+  network topology (node/pod/rack), placement config, proportional
+  comm-domain decomposition, and per-level cost composition.

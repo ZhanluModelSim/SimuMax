@@ -103,7 +103,9 @@ Key characteristics:
   path (implemented), `design_simu_network_fabric.md` (+ `-zh` mirror)
   for NIC-level cross-node contention modeling (implemented), and
   `design_simu_cost_model_tunability.md` (+ `-zh` mirror) for planned
-  per-operator cost-model tunability and declarative model recipes.
+  per-operator cost-model tunability and declarative model recipes, and
+  `design_simu_hierarchical_network.md` (+ `-zh` mirror) for planned
+  multi-level (node/pod/rack) network topology modeling.
 
 ## Build / Install / Run
 
