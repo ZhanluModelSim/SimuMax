@@ -286,6 +286,8 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
             )   
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
@@ -393,6 +395,8 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
                 comm_stage="Dispatch_FWD_EP"
             )
         
@@ -402,6 +406,8 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
                 comm_stage="Dispatch_BWD_EP"
             )
 
@@ -413,6 +419,8 @@ class Permutation(MetaModule):
                     prob_comm_size,
                     comm_num=self.strategy.ep_size,
                     net=self.strategy.ep_net,
+                    strategy=self.strategy,
+                    group_kind="ep",
                     comm_stage="Dispatch_PROB_FWD_EP"
                 )
                 self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
@@ -420,6 +428,8 @@ class Permutation(MetaModule):
                     prob_comm_size,
                     comm_num=self.strategy.ep_size,
                     net=self.strategy.ep_net,
+                    strategy=self.strategy,
+                    group_kind="ep",
                     comm_stage="Dispatch_PROB_BWD_EP"
                 )
             # HACK(sherry)
@@ -630,6 +640,8 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
             )   
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
@@ -728,6 +740,8 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
                 comm_stage="Combine_FWD_EP"
             )
             # bwd
@@ -736,6 +750,8 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
+                strategy=self.strategy,
+                group_kind="ep",
                 comm_stage="Combine_BWD_EP"
             )
         if self.enable_recompute:

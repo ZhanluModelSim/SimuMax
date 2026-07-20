@@ -445,6 +445,18 @@ class PerfBase(ABC):
             self.strategy.edp_net = "high_intra_node" if condition else "inter_node"
         
     def analysis_net(self, re_analysis = False):
+        # Net-field semantics C (docs/design_simu_hierarchical_network.md,
+        # section 7): when the system declares `topology.levels`, an "auto"
+        # net field resolves to the pseudo-net "levels" so that
+        # `compute_net_op_time` composes per-level costs; an explicitly-set
+        # field (e.g. "inter_node") keeps the legacy single-net path.
+        levels = (self.system.topology or {}).get("levels")
+        if levels:
+            for field in ("pp_net", "ep_net", "tp_net", "cp_net",
+                          "etp_net", "dp_net", "edp_net"):
+                if getattr(self.strategy, field) == "auto":
+                    setattr(self.strategy, field, "levels")
+            return
         if self.system.intra_with_pcie:
             self.analysis_pcie_net(re_analysis)
         else:
@@ -1582,28 +1594,31 @@ class PerfLLM(PerfBase):
                     bucket_size,
                     comm_num=group_size,
                     net=dp_net,
-                    comm_stage=dp_group, 
-                    strategy=self.strategy
+                    comm_stage=dp_group,
+                    strategy=self.strategy,
+                    group_kind=dp_group
                 )
                 all_gather_time = num_gather_bucket * self.system.compute_net_op_time(
-                    "all_gather", 
-                    bucket_size, 
-                    comm_num=group_size, 
+                    "all_gather",
+                    bucket_size,
+                    comm_num=group_size,
                     net=dp_net,
                     comm_stage=dp_group,
-                    strategy=self.strategy
+                    strategy=self.strategy,
+                    group_kind=dp_group
                 )
                 dp_comm_time += all_gather_time + reduce_scatter_time
                 details['reduce_scatter_time'] = reduce_scatter_time
                 details['all_gather_time'] = all_gather_time
             else:
                 dp_comm_time += num_reduce_bucket * self.system.compute_net_op_time(
-                    "all_reduce", 
-                    bucket_size, 
-                    comm_num=group_size, 
+                    "all_reduce",
+                    bucket_size,
+                    comm_num=group_size,
                     net=dp_net,
                     comm_stage=dp_group,
-                    strategy=self.strategy
+                    strategy=self.strategy,
+                    group_kind=dp_group
                 )
 
             dp_comm_exposed_time = dp_comm_time  # no overlap for now
@@ -2695,7 +2710,10 @@ class PerfLLM(PerfBase):
                 self.model_config.hidden_size,
                 self.dtype_to_element_size[self.strategy.dtype],
             )
-            p2p_time = self.system.compute_net_op_time("p2p", pp_comm_size, 2, net=self.strategy.pp_net)
+            p2p_time = self.system.compute_net_op_time(
+                "p2p", pp_comm_size, 2, net=self.strategy.pp_net,
+                strategy=self.strategy, group_kind="pp"
+            )
 
         stage_key = self._chunk_stage_key(model_name)
         if self.strategy.pp_size <= 1:

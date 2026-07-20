@@ -156,7 +156,8 @@ class PpSchedule(MetaModule):
             self.dtype_to_element_size[self.strategy.dtype],
         )
         pp_cost = self.system.compute_net_op_time(
-            "p2p", pp_comm_size, 2, net=self.strategy.pp_net
+            "p2p", pp_comm_size, 2, net=self.strategy.pp_net,
+            strategy=self.strategy, group_kind="pp"
         )
 
         def _make_model(chunk_idx: int, real_mb: int, mb_virtual: int):
@@ -781,7 +782,8 @@ class PpSchedule(MetaModule):
             self.dtype_to_element_size[self.strategy.dtype],
         )
         pp_cost = self.system.compute_net_op_time(
-            "p2p", pp_comm_size, 2, net=self.strategy.pp_net
+            "p2p", pp_comm_size, 2, net=self.strategy.pp_net,
+            strategy=self.strategy, group_kind="pp"
         )  # p2p
         use_async_pp_comm = getattr(self.strategy, "pp_comm_async", True)
 

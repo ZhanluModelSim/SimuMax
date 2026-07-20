@@ -7,10 +7,16 @@ from collections import OrderedDict
 import json
 import copy
 import math
+import types
 import warnings
 import re
 
-from simumax.core.utils import to_json_string, group_cross_node_ratio
+from simumax.core.utils import (
+    to_json_string,
+    group_cross_node_ratio,
+    group_level_span,
+    all2all_level_fraction,
+)
 from simumax.core.fusion import FUSION_POLICIES, build_fusion_policy
 from simumax.core.cost_specs import get_block_template
 
@@ -896,6 +902,10 @@ class SystemConfig(Config):
     fabric_model: Optional[str] = None
     # Fabric topology knobs; reserved keys are "tor_capacity_gbps"
     # (number) and "tor_node_share" ("auto" or number >= 1).
+    # Hierarchical-network keys (design_simu_hierarchical_network.md
+    # section 3): "levels" (ordered list of {"name", "size", "net"},
+    # innermost first; first level's size must equal num_per_node) and
+    # "composition_policy" (per-op-type "max"/"serial" overrides).
     topology: Optional[Dict[str, Any]] = None
     # Machine-level per-operator efficiency table (cost-tunability design doc
     # section 4). Grammar per key (class_key or path_key): a scalar in (0, 1],
@@ -1231,6 +1241,11 @@ class SystemConfig(Config):
         """
         # Using ring alg for now
         assert op_name in kNetOp, f"{op_name} not exist on {kNetOp}"
+        if net == self.LEVELS_NET:
+            # Hierarchical levels path (design_simu_hierarchical_network.md
+            # sections 5-7); fully separate from the single-net path below.
+            return self._compute_net_op_time_levels(
+                op_name, size, comm_num, comm_stage, strategy, group_kind)
         net_data = self.networks.get(net, None)
         assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
         op:NetOpConfig = net_data.op.get(op_name, None)  # 0: scale 1: offset 2: efficient_factor
@@ -1354,6 +1369,169 @@ class SystemConfig(Config):
         self.record_net_bw(op_name, net, comm_num, comm_stage, net_data.bandwidth.gbps, bw*eff_factor, eff_factor, time*1e3, actual_size, latency)
         return time
 
+    def _composition_policy_for(self, op_name: str) -> str:
+        """Composition policy of an op on the levels path (design doc 6).
+
+        Defaults: all2all -> "max" (bottleneck level), collectives
+        (all_reduce/all_gather/reduce_scatter) -> "serial" (phase sum),
+        p2p -> "serial". topology["composition_policy"] overrides per key.
+        """
+        policies = (self.topology or {}).get("composition_policy") or {}
+        if op_name == "all2all":
+            return policies.get("all2all", "max")
+        if op_name == "p2p":
+            return policies.get("p2p", "serial")
+        return policies.get("collectives", "serial")
+
+    def _level_net_params(self, net: str, op_name: str, comm_num: int):
+        """Resolve (scale, offset, eff_factor, bw_gbps, latency_us, fixed_latency_us)
+        for one level's net entry.
+
+        Same resolution rules as the single-net path: op-level overrides
+        first, then the net bandwidth defaults. The num_per_node == 8
+        latency scaling of the legacy path is intentionally NOT applied
+        on the levels path.
+        """
+        net_data = self.networks.get(net, None)
+        assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
+        op: NetOpConfig = net_data.op.get(op_name, None)
+        assert op is not None, f"{op_name} not exist on {net_data}"
+        scale, offset, eff_factor = op.scale, op.offset, op.efficient_factor
+        if eff_factor is None:
+            eff_factor = net_data.bandwidth.efficient_factor
+        base_latency = op.latency_us if op.latency_us is not None else net_data.bandwidth.latency_us
+        fixed_latency = self._lookup_comm_num_value(
+            op.fixed_latency_us_by_comm_num,
+            comm_num,
+            op.fixed_latency_us,
+        )
+        if fixed_latency is None:
+            fixed_latency = self._lookup_comm_num_value(
+                net_data.bandwidth.fixed_latency_us_by_comm_num,
+                comm_num,
+                net_data.bandwidth.fixed_latency,
+            )
+        return scale, offset, eff_factor, net_data.bandwidth.gbps, base_latency, fixed_latency
+
+    def _compute_net_op_time_levels(self, op_name: str, size: int, comm_num: int,
+                                    comm_stage: str, strategy: "StrategyConfig",
+                                    group_kind: str):
+        """Hierarchical per-level cost composition (design doc sections 5-6).
+
+        The group's traffic is decomposed across topology["levels"] via
+        `group_level_span` (composition [c_0, c_1, ...]; a phase exists at
+        level i iff c_i > 1) and each level is charged with its own net
+        profile. Per op type:
+
+        - all2all: time_i = (size * scale_i * all2all_level_fraction(i))
+          / (bw_i * eff_i) + latency_i over the levels whose boundary the
+          group crosses (fraction > 0); total = max (or sum when the
+          "all2all" policy is overridden to "serial").
+        - collectives: serial ring phases; for each level with c_i > 1,
+          phase_size = actual_size_base_i * (c_i - 1) / c_i with
+          actual_size_base_i = size*scale_i + size*scale_i/comm_num*offset_i
+          (the legacy actual_size formula with that level's op params);
+          phase_time = phase_size / (bw_i * eff_i) + latency_i;
+          total = sum (or max when overridden).
+        - p2p: serial over the levels the endpoint path crosses. The two
+          endpoints are adjacent pipeline stages, so their path is computed
+          from a 2-member pair at the group stride (not the whole group's
+          span): level 0 is used only when both endpoints share one node
+          (units_0 == 1); level i >= 1 is crossed when the pair sits in
+          different units of level i-1 (units_{i-1} > 1). Each crossed
+          level carries the full mirrored actual_size once (comm_num stays
+          the caller's send/recv-pair convention, 2); total = sum (or max
+          when overridden).
+
+        Intentional differences vs the legacy single-net path:
+        - the num_per_node == 8 latency scaling is NOT applied (each
+          level contributes its fitted base latency + fixed latency);
+        - the FC8 intra-node bandwidth scaling and the pcie dp_fixed_bw
+          shortcut are NOT applied per level;
+        - the p2p inter-node NIC-share division (bw /= num_per_node) is
+          NOT applied; a level's net bandwidth is the link bandwidth;
+        - collectives multiply the legacy actual_size (whose fitted
+          offset already encodes a ring factor when offset = -1) by the
+          per-phase (c_i - 1)/c_i factor, so with offset = -1 the
+          degenerate single-phase case is a (K-1)/K factor below the
+          legacy number (12.5% at K = 8); declare level nets with
+          offset = 0 for byte-exact degenerate equivalence.
+        """
+        assert strategy is not None, (
+            f"net='levels' requires strategy, op_name={op_name}, comm_stage={comm_stage}")
+        assert group_kind is not None, (
+            f"net='levels' requires group_kind, op_name={op_name}, comm_stage={comm_stage}")
+        levels = (self.topology or {}).get("levels")
+        assert levels, (
+            f"net='levels' requires topology['levels'] to be declared, "
+            f"op_name={op_name}, comm_stage={comm_stage}")
+        composition, spans = group_level_span(group_kind, strategy, levels)
+        if op_name == "p2p":
+            # p2p involves two adjacent stages, not the whole group: a
+            # 2-member group at the same stride would give c_i == 1 at
+            # every level, so the path is derived from the pair's
+            # units_touched instead of the composition.
+            pair = strategy
+            if group_kind == "pp" and strategy.pp_size > 2:
+                pair = types.SimpleNamespace(
+                    pp_size=2, tp_size=strategy.tp_size,
+                    cp_size=strategy.cp_size, dp_size=strategy.dp_size)
+            _, spans = group_level_span(group_kind, pair, levels)
+        policy = self._composition_policy_for(op_name)
+        # (span, phase_size, bw, eff_factor, phase_time_ms, base_latency_us)
+        phases = []
+        for i, span in enumerate(spans):
+            scale, offset, eff_factor, bw, base_latency, fixed_latency = \
+                self._level_net_params(span.net, op_name, comm_num)
+            if op_name == "all2all":
+                # Per-level share of each member's traffic; levels whose
+                # boundary nobody crosses (fraction == 0) are skipped
+                # entirely, latency included.
+                fraction = all2all_level_fraction(group_kind, strategy, levels, i)
+                if fraction <= 0:
+                    continue
+                phase_size = size * scale * fraction
+            elif op_name == "p2p":
+                # Level 0 carries the pair only when both endpoints share
+                # one node; level i >= 1 carries it when the endpoints sit
+                # in different units of level i-1.
+                crossed = spans[0].units_touched == 1 if i == 0 \
+                    else spans[i - 1].units_touched > 1
+                if not crossed:
+                    continue
+                phase_size = size * scale + size * scale / comm_num * offset
+            else:
+                if composition[i] <= 1:
+                    continue
+                actual_size_base = size * scale + size * scale / comm_num * offset
+                phase_size = actual_size_base * (composition[i] - 1) / composition[i]
+            phase_time = (
+                phase_size / (bw * 1024**3 * eff_factor) * 1e3
+                + (base_latency + fixed_latency) / 1e3
+            )
+            phases.append((span, phase_size, bw, eff_factor, phase_time, base_latency))
+        if not phases:
+            # Group of one (or no crossed level): no communication.
+            return 0.0
+        if policy == "max":
+            total_time = max(phase[4] for phase in phases)
+        else:
+            total_time = sum(phase[4] for phase in phases)
+        # net_info.json decomposition: one record per level under
+        # "levels:<stage>:<level>" plus the composed total under
+        # "levels:<stage>". Records keep the legacy field set.
+        stage_key = comm_stage.lower()
+        for span, phase_size, bw, eff_factor, phase_time, base_latency in phases:
+            self.record_net_bw(
+                op_name, span.net, comm_num, f"levels:{stage_key}:{span.name}",
+                bw, bw * eff_factor, eff_factor, phase_time * 1e3,
+                phase_size, base_latency)
+        self.record_net_bw(
+            op_name, self.LEVELS_NET, comm_num, f"levels:{stage_key}",
+            None, None, None, total_time * 1e3, size,
+            sum(phase[5] for phase in phases))
+        return total_time
+
     def compute_end2end_time(self, compute_time, mem_time):
         """
         According to the accelerator mode, return the end2end time.
@@ -1380,6 +1558,15 @@ class SystemConfig(Config):
     FABRIC_MODELS = ("nic", "nic+tor")
     # Reserved keys of the `topology` dict.
     RESERVED_TOPOLOGY_KEYS = ("tor_capacity_gbps", "tor_node_share")
+    # Reserved pseudo-net name selecting the hierarchical levels cost path
+    # (hierarchical-network design doc sections 6-7). Never a real key of
+    # `networks`; resolved to topology["levels"] at call time.
+    LEVELS_NET = "levels"
+    # Hierarchical-topology keys of the `topology` dict (design doc section 3).
+    LEVELS_TOPOLOGY_KEYS = ("levels", "composition_policy")
+    # composition_policy keys and values (design doc sections 3/6).
+    COMPOSITION_POLICY_KEYS = ("all2all", "collectives", "p2p")
+    COMPOSITION_POLICIES = ("max", "serial")
 
     def simu_resource_lanes(self) -> list[str]:
         """Pinned resource-lane contract for the simulator (design doc 4.2).
@@ -1443,19 +1630,29 @@ class SystemConfig(Config):
         )
         if self.topology is None:
             return
-        if self.fabric_model is None:
+        assert isinstance(self.topology, dict), (
+            f"topology must be a dict, but got {type(self.topology)}"
+        )
+        if self.fabric_model is None and any(
+            key in self.topology for key in self.RESERVED_TOPOLOGY_KEYS
+        ):
+            # The tor_* knobs only take effect inside the fabric model;
+            # topology["levels"] is meaningful on its own (analytical
+            # levels cost path), so it does not trigger this warning.
             warnings.warn(
                 "topology is set but fabric_model is None; topology is only "
                 "meaningful with fabric_model 'nic' or 'nic+tor'"
             )
-        assert isinstance(self.topology, dict), (
-            f"topology must be a dict, but got {type(self.topology)}"
-        )
-        reserved_keys = set(self.RESERVED_TOPOLOGY_KEYS)
+        if "composition_policy" in self.topology and "levels" not in self.topology:
+            warnings.warn(
+                "topology['composition_policy'] is set but topology['levels'] "
+                "is missing; the policy has no effect"
+            )
+        allowed_keys = set(self.RESERVED_TOPOLOGY_KEYS) | set(self.LEVELS_TOPOLOGY_KEYS)
         for key, value in self.topology.items():
-            assert key in reserved_keys, (
+            assert key in allowed_keys, (
                 f"unknown topology key {key!r}, "
-                f"reserved keys are {sorted(reserved_keys)}"
+                f"reserved keys are {sorted(allowed_keys)}"
             )
             if key == "tor_capacity_gbps":
                 assert isinstance(value, (int, float)) and not isinstance(value, bool), (
@@ -1470,6 +1667,67 @@ class SystemConfig(Config):
                     "topology['tor_node_share'] must be 'auto' or a number >= 1, "
                     f"but got {value!r}"
                 )
+            elif key == "levels":
+                self._validate_topology_levels(value)
+            elif key == "composition_policy":
+                self._validate_composition_policy(value)
+
+    def _validate_topology_levels(self, levels):
+        """Validate topology["levels"] (hierarchical-network design doc section 3).
+
+        Levels are ordered innermost->outermost; each entry is exactly
+        {"name", "size", "net"} with size = units of the previous level
+        contained in this level (the first level's unit is one GPU, so its
+        size must equal num_per_node). `net` must reference `networks`.
+        """
+        assert isinstance(levels, list) and len(levels) > 0, (
+            f"topology['levels'] must be a non-empty list, but got {levels!r}"
+        )
+        names = set()
+        for idx, entry in enumerate(levels):
+            assert isinstance(entry, dict), (
+                f"topology['levels'][{idx}] must be a dict, but got {type(entry)}"
+            )
+            assert set(entry.keys()) == {"name", "size", "net"}, (
+                f"topology['levels'][{idx}] must have exactly keys "
+                f"['name', 'net', 'size'], but got {sorted(entry.keys())}"
+            )
+            name, size, net = entry["name"], entry["size"], entry["net"]
+            assert isinstance(name, str) and name, (
+                f"topology['levels'][{idx}]['name'] must be a non-empty str, "
+                f"but got {name!r}"
+            )
+            assert isinstance(size, int) and not isinstance(size, bool) and size >= 1, (
+                f"topology['levels'][{idx}]['size'] must be an int >= 1, but got {size!r}"
+            )
+            assert isinstance(net, str) and net in self.networks, (
+                f"topology['levels'][{idx}]['net'] must be one of "
+                f"{sorted(self.networks.keys())}, but got {net!r}"
+            )
+            assert name not in names, (
+                f"topology['levels'][{idx}]['name'] {name!r} is duplicated"
+            )
+            names.add(name)
+        first_size = levels[0]["size"]
+        assert first_size == self.num_per_node, (
+            f"topology['levels'][0]['size'] must equal num_per_node "
+            f"({self.num_per_node}), but got {first_size}"
+        )
+
+    def _validate_composition_policy(self, policy):
+        """Validate topology["composition_policy"] (design doc sections 3/6)."""
+        assert isinstance(policy, dict), (
+            f"topology['composition_policy'] must be a dict, but got {type(policy)}"
+        )
+        for key, value in policy.items():
+            assert key in self.COMPOSITION_POLICY_KEYS, (
+                f"unknown topology['composition_policy'] key {key!r}, "
+                f"allowed keys are {list(self.COMPOSITION_POLICY_KEYS)}"
+            )
+            assert value in self.COMPOSITION_POLICIES, (
+                f"topology['composition_policy'][{key!r}] must be one of "
+                f"{list(self.COMPOSITION_POLICIES)}, but got {value!r}"
+            )
 
 
 @dataclass

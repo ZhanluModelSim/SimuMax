@@ -456,6 +456,72 @@ Optional fields enabling the network-fabric contention model of the DES
 - `topology` is only meaningful together with `fabric_model`; setting it
   while `fabric_model` is absent triggers a warning.
 
+## topology.levels / composition_policy (Preview)
+
+Optional multi-level network topology declaration (Phase 1 of
+[design_simu_hierarchical_network.md](./design_simu_hierarchical_network.md)).
+It models clusters with more than one link hierarchy — N GPUs per node via
+link A, M nodes per pod via link B, P pods per rack via link C — and charges
+every communication domain through the levels it actually spans. When
+`topology.levels` is absent, results are bit-identical to the flat two-level
+model.
+
+```json
+"topology": {
+    "levels": [
+        {"name": "node", "size": 8,   "net": "high_intra_node"},
+        {"name": "pod",  "size": 32,  "net": "inter_node"},
+        {"name": "rack", "size": 256, "net": "inter_rack"}
+    ],
+    "composition_policy": {"all2all": "max", "collectives": "serial", "p2p": "serial"}
+}
+```
+
+Schema rules:
+
+- `levels` is ordered innermost → outermost. `size` says how many units of
+  the previous level one unit of this level contains (`node.size=8` ⇒ 8
+  GPUs/node; `pod.size=32` ⇒ 32 nodes/pod = 256 GPUs; `rack.size=256` ⇒ 256
+  pods/rack). The first level's "unit" is one GPU.
+- The first level must be the node level whose `size` equals
+  `num_per_node` (validated), which keeps every existing
+  `num_per_node`-based correction consistent.
+- `net` points at an entry in the existing `networks` dict — no schema
+  change there; adding a profile such as `inter_rack` is just data. Each
+  level's bandwidth/latency/fitted op factors come from that net entry.
+- `composition_policy` sets the per-collective-type cost composition;
+  the defaults shown (`all2all` → `max`, hierarchical collectives →
+  `serial`, `p2p` → `serial`) apply to any entry left unspecified.
+
+Net-field semantics C (per strategy comm family `tp_net`, `pp_net`, …):
+
+| strategy net field | with `topology.levels` | without `topology.levels` |
+|---|---|---|
+| `"auto"` (default) | resolves to the pseudo-net `"levels"`: the cost is composed per level from the group's per-level composition | today's binary resolution (`high_intra_node` / `inter_node`, or the pcie variants) |
+| explicitly set (e.g. `"inter_node"`) | legacy single-net path for that family — the escape hatch (force worst-case analysis or emulate a rank remap) | unchanged |
+
+Composition policies:
+
+- `serial` (hierarchical collectives `all_reduce` / `all_gather` /
+  `reduce_scatter`): the collective is decomposed into one phase per
+  level and the total time is the sum of the phase times, where each
+  phase uses that level's net profile with the level's sub-group size —
+  matching hierarchical NCCL behavior (intra-node reduce → pod
+  all_reduce → rack all_reduce → …).
+- `max` (`all2all`): each pair's time is bounded by the slowest link on
+  its path, so the total is the max over levels of the per-level
+  transfer time.
+- `p2p`: `serial` over the levels on the path between the two endpoints.
+
+Example — with the three levels above, a 32-member group (e.g. `dp=32`
+with the default placement) composes as `[2, 8, 2]`: 2 members per
+node, 8 nodes per pod, 2 pods per rack (2 × 8 × 2 = 32). A `serial`
+all_reduce on that group sums three phases (in-node k=2, in-pod k=8,
+in-rack k=2); an `all2all` takes the max of the three per-level times.
+The per-level proportions of every comm domain come from the placement
+(default order `tp-cp-ep-dp-pp`, innermost first); see sections 3 and
+5–7 of the design doc for the mapping and cost math.
+
 ## operator_efficiency (optional)
 
 Optional per-operator efficiency table for the analytical cost model

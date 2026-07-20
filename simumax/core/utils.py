@@ -306,6 +306,78 @@ def group_cross_node_ratio(group_kind, strategy, num_per_node):
     return (node_count - 1) / node_count
 
 
+# --- Hierarchical level mapping (design_simu_hierarchical_network.md, T2) ---
+#
+# A "levels" topology is an ordered list of {"name", "size", "net"}
+# entries, innermost first, where size counts how many units of the
+# previous level this level contains (the first level's unit is one GPU).
+class LevelSpan:
+    """How one comm domain decomposes across one topology level."""
+
+    def __init__(self, name, size, net, span, units_touched, members_per_unit):
+        self.name = name
+        self.size = size
+        self.net = net
+        self.span = span                    # cumulative GPUs per unit
+        self.units_touched = units_touched  # distinct units of this level
+        self.members_per_unit = members_per_unit
+
+    def __repr__(self):
+        return (f"LevelSpan({self.name}: size={self.size} net={self.net} "
+                f"units={self.units_touched} members/unit={self.members_per_unit:g})")
+
+
+def group_level_span(group_kind, strategy, levels):
+    """Decompose a parallelism group across a hierarchical topology.
+
+    Returns (composition, spans):
+    - composition: list of c_L = touched units of level L-1 per touched
+      unit of level L (the user's [2, 8, 2]-style proportions);
+      c_L > 1 means a communication phase exists at level L.
+    - spans: list[LevelSpan] with units_touched / members_per_unit.
+
+    levels: list of dicts {"name", "size", "net"} (innermost first).
+    With a single level of size num_per_node this reduces to
+    group_node_stats semantics (composition == [members per node]).
+    """
+    group_size, stride = _group_size_and_stride(group_kind, strategy)
+    if not levels:
+        return [group_size], []
+    spans = []
+    cumulative = 1
+    for entry in levels:
+        cumulative *= int(entry["size"])
+        if group_size <= 1:
+            units = 1
+        elif stride >= cumulative:
+            units = group_size
+        else:
+            units = (group_size - 1) * stride // cumulative + 1
+        members = group_size / units if units else 0.0
+        spans.append(LevelSpan(entry["name"], int(entry["size"]), entry["net"],
+                               cumulative, units, members))
+    composition = []
+    prev = group_size
+    for span in spans:
+        c = prev / span.units_touched if span.units_touched else 0.0
+        composition.append(c)
+        prev = span.units_touched
+    return composition, spans
+
+
+def all2all_level_fraction(group_kind, strategy, levels, level_index):
+    """Fraction of an all2all member's traffic that crosses the given level's links.
+
+    Peers inside the same unit do not cross: frac = (K - K/U_L) / (K - 1).
+    """
+    group_size, _ = _group_size_and_stride(group_kind, strategy)
+    if group_size <= 1:
+        return 0.0
+    _, spans = group_level_span(group_kind, strategy, levels)
+    span = spans[level_index]
+    return (group_size - span.members_per_unit) / (group_size - 1)
+
+
 # --- Machine-level straggler model (design_simu_network_fabric.md, Phase C) ---
 #
 # Shared by the analytical path (PerfLLM, gated by
