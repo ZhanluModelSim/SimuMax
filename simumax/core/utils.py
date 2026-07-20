@@ -195,7 +195,11 @@ def get_pp_stage_representative_rank(pp_rank, strategy):
     """Pick the representative dense rank for one PP stage.
 
     The representative rank keeps `tp=0`, `cp=0`, and `dp=0`, and varies only
-    along the pipeline dimension.
+    along the pipeline dimension. pp is always the outermost dim — its stride
+    is the product of all dense dims under any placement (see
+    `_dense_strides`) — so with the inner coords fixed at 0 the member sits
+    at `pp_rank * tp*cp*dp` whatever the inner permutation is (inner dims
+    contribute 0 * stride = 0). The formula is placement-invariant.
     """
 
     return pp_rank * strategy.tp_size * strategy.cp_size * strategy.dp_size
@@ -213,15 +217,79 @@ def get_pp_p2p_comm_size(strategy, hidden_size, dtype_size):
     return pp_comm_size
 
 
-def get_rank_group(global_rank, strategy):
-    ## dense order: tp-cp-dp-pp
-    ## moe order remains ep-etp-edp-pp
+# --- Placement parsing (design_simu_hierarchical_network.md, section 4) ---
+#
+# `strategy.order_of_paralielism` declares how the dense parallel dims are
+# laid onto the physical hierarchy, innermost first (the default
+# "tp-cp-ep-dp-pp" is the legacy hardcoded mesh). The MoE mesh (ep/etp/edp)
+# keeps its fixed order and pp is always outermost (v1 constraint), so a
+# placement reduces to a permutation of the dense dims tp/cp/dp.
+DEFAULT_PLACEMENT = ["tp", "cp", "dp"]
 
-    tp_rank = global_rank % strategy.tp_size
-    cp_rank = (global_rank // strategy.tp_size) % strategy.cp_size
-    dp_rank = (global_rank // (strategy.tp_size * strategy.cp_size)) % strategy.dp_size
-    dp_cp_rank = (global_rank // strategy.tp_size) % (strategy.cp_size * strategy.dp_size)
-    pp_rank = (global_rank // (strategy.tp_size * strategy.cp_size * strategy.dp_size))
+
+def parse_placement(order_str):
+    """Parse `order_of_paralielism` into the dense dim order (innermost first).
+
+    Returns the dense dims as a list, e.g. "tp-cp-ep-dp-pp" ->
+    ["tp", "cp", "dp"] and "cp-tp-ep-dp-pp" -> ["cp", "tp", "dp"].
+    Rules (mirrors StrategyConfig._validate_order_of_paralielism):
+    None/missing -> DEFAULT_PLACEMENT; "ep" tokens are dropped (the MoE mesh
+    placement is fixed); the remaining tokens must be exactly one each of
+    tp/cp/dp in any order with an optional trailing "pp" (pp, when present,
+    must be outermost); anything else raises ValueError.
+    """
+    if order_str is None:
+        return list(DEFAULT_PLACEMENT)
+    tokens = str(order_str).split("-")
+    if any(token == "" for token in tokens):
+        raise ValueError(f"invalid placement {order_str!r}: empty token")
+    tokens = [token for token in tokens if token != "ep"]
+    if "pp" in tokens:
+        if tokens[-1] != "pp":
+            raise ValueError(
+                f"invalid placement {order_str!r}: pp must be outermost (last)")
+        tokens.pop()
+    if sorted(tokens) != ["cp", "dp", "tp"]:
+        raise ValueError(
+            f"invalid placement {order_str!r}: dense dims must contain "
+            "exactly one each of tp/cp/dp in any order")
+    return tokens
+
+
+def _dense_strides(strategy, placement=None):
+    """Return per-dim member strides of the dense mesh from the placement.
+
+    A dim's stride is the product of the sizes of the dims placed BEFORE it
+    (the inner dims): with the default placement ["tp", "cp", "dp"] this
+    yields exactly tp=1, cp=tp_size, dp=tp_size*cp_size. "pp" is always
+    outermost (v1 constraint), so its stride is the product of all dense
+    dims regardless of the declared order.
+    """
+    if placement is None:
+        placement = parse_placement(getattr(strategy, "order_of_paralielism", None))
+    strides = {}
+    stride = 1
+    for dim in placement:
+        strides[dim] = stride
+        stride *= getattr(strategy, f"{dim}_size")
+    strides["pp"] = stride
+    return strides
+
+
+def get_rank_group(global_rank, strategy, placement=None):
+    ## dense order: parsed from strategy.order_of_paralielism (default
+    ## tp-cp-dp, pp always outermost); moe order remains ep-etp-edp-pp
+
+    strides = _dense_strides(strategy, placement)
+    tp_rank = (global_rank // strides["tp"]) % strategy.tp_size
+    cp_rank = (global_rank // strides["cp"]) % strategy.cp_size
+    dp_rank = (global_rank // strides["dp"]) % strategy.dp_size
+    # dp_cp flattens the (cp, dp) plane with cp inner, the same enumeration
+    # as the legacy default-order formula (rank // tp) % (cp*dp); the coords
+    # above are placement-aware, so the flattening stays valid (a bijection
+    # within the group) under any order.
+    dp_cp_rank = cp_rank + dp_rank * strategy.cp_size
+    pp_rank = global_rank // strides["pp"]
     ep_rank = global_rank % strategy.ep_size
     edp_rank = global_rank // strategy.ep_size % strategy.edp_size
     tp_group_id = f"pp:{pp_rank}-cp:{cp_rank}-dp:{dp_rank}"
@@ -253,21 +321,31 @@ def get_rank_group(global_rank, strategy):
 # --- Group -> node mapping (design_simu_network_fabric.md, Tier A) ---
 #
 # Members of a single-dimension group form an arithmetic progression
-# `base + k*stride` in the rank mesh (dense order tp-cp-dp-pp, MoE order
-# ep-etp-edp-pp). The node count and cross-node traffic ratio of any
-# collective therefore follow in O(1) from (group_size, stride).
-def _group_size_and_stride(group_kind, strategy):
+# `base + k*stride` in the rank mesh. The dense strides come from the
+# placement (`_dense_strides`; default order tp-cp-dp with pp outermost,
+# MoE order fixed ep-etp-edp-pp). The node count and cross-node traffic
+# ratio of any collective therefore follow in O(1) from (group_size, stride).
+def _group_size_and_stride(group_kind, strategy, placement=None):
     """Return (group_size, member_stride) for a parallelism group kind."""
-    if group_kind == "tp":
-        return strategy.tp_size, 1
-    if group_kind == "cp":
-        return strategy.cp_size, strategy.tp_size
-    if group_kind == "dp":
-        return strategy.dp_size, strategy.tp_size * strategy.cp_size
-    if group_kind == "dp_cp":
-        return strategy.dp_size * strategy.cp_size, strategy.tp_size
-    if group_kind == "pp":
-        return strategy.pp_size, strategy.tp_size * strategy.cp_size * strategy.dp_size
+    if group_kind in ("tp", "cp", "dp", "dp_cp", "pp"):
+        strides = _dense_strides(strategy, placement)
+        if group_kind in ("tp", "cp", "dp"):
+            return getattr(strategy, f"{group_kind}_size"), strides[group_kind]
+        if group_kind == "dp_cp":
+            # dp_cp is Megatron's dense optimizer/data-parallel group: the
+            # (cp, dp) plane with tp/pp fixed, size cp*dp. Derivation: the
+            # plane is exactly the progression `base + k*min(stride_cp,
+            # stride_dp)` whenever cp and dp are adjacent in the placement —
+            # the inner of the two dims then tiles the plane contiguously
+            # (default order: stride_cp=tp, stride_dp=tp*cp -> stride tp,
+            # identical to the legacy hardcode). When tp sits between cp and
+            # dp (orders cp-tp-dp / dp-tp-cp) the plane is not an exact
+            # progression — the outer dim's blocks are strided by more than
+            # the inner dim's span — and we keep the inner dim's stride as
+            # the contiguous-plane approximation (v1 limitation).
+            return (strategy.dp_size * strategy.cp_size,
+                    min(strides["cp"], strides["dp"]))
+        return strategy.pp_size, strides["pp"]
     if group_kind == "ep":
         return strategy.ep_size, 1
     if group_kind == "etp":

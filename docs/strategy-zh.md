@@ -162,6 +162,15 @@ MOE模型的路由策略， 默认为"all2all"
 控制第一个和最后一个Pipeline Parallel stage包含的层数，默认为None
 ### interleaving_size
 虚拟 pipeline 大小。第一次起步时保持 `1` 即可。`interleaving_size > 1` 时，`pp_size` 也必须大于 `1`。
+### order_of_paralielism
+稠密并行维度在机器网络层级上的放置（placement）顺序，从内到外排列，默认
+`"tp-cp-ep-dp-pp"`（即当前内置的 mesh 顺序）。语法：以 `-` 分隔的 token，
+`tp`/`cp`/`dp` 三者各出现一次、顺序任意；`ep` token 可选、可出现在任意位置
+（会被忽略——MoE mesh 的放置是固定的）；`pp` 可选、只能出现在末尾
+（`pp` 出现时必须位于最外层）。示例：`"tp-cp-ep-dp-pp"`（默认）与
+`"cp-tp-ep-dp-pp"`（cp 位于最内层）。它影响分层网络模型中 levels 成本路径与
+net 放置所用的通信组构成 / stride 计算。约束：`pp` 始终位于最外层；
+`ep`/MoE mesh 放置固定。详见 `docs/design_simu_hierarchical_network.md` 第 4 节。
 ### zero_state
 ZeRO优化配置，目前只支持zero0和1，默认为1
 ## 内存优化

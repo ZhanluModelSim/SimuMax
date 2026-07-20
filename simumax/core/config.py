@@ -675,9 +675,46 @@ class StrategyConfig(Config):
             res.append(getattr(self, f"{x}_size"))
         return res
 
+    def _validate_order_of_paralielism(self):
+        """Validate the placement string (hierarchical-network design doc, section 4).
+
+        Grammar: '-'-separated tokens with exactly one each of tp/cp/dp in any
+        order (innermost first), optional 'ep' tokens anywhere (dropped — the
+        MoE mesh placement is fixed), and an optional trailing 'pp' (pp, when
+        present, must be outermost). None falls back to the default placement.
+        Mirrors parse_placement() in core/utils.py.
+        """
+        grammar = (
+            "accepted grammar: '-'-separated tokens, exactly one each of "
+            "tp/cp/dp in any order, optional 'ep' tokens anywhere (ignored, "
+            "MoE mesh placement is fixed), optional trailing 'pp' (pp must be "
+            "outermost when present), e.g. 'tp-cp-ep-dp-pp' (default) or "
+            "'cp-tp-ep-dp-pp'"
+        )
+        order = self.order_of_paralielism
+        if order is None:
+            return
+        tokens = str(order).split("-")
+
+        def _invalid(reason):
+            return ValueError(
+                f"Invalid order_of_paralielism '{order}': {reason}; {grammar}"
+            )
+
+        if any(token == "" for token in tokens):
+            raise _invalid("empty token")
+        tokens = [token for token in tokens if token != "ep"]
+        if "pp" in tokens:
+            if tokens[-1] != "pp":
+                raise _invalid("pp must be outermost (last)")
+            tokens.pop()
+        if sorted(tokens) != ["cp", "dp", "tp"]:
+            raise _invalid(
+                "dense dims must contain exactly one each of tp/cp/dp in any order"
+            )
+
     def sanity_check(self):
-        if self.order_of_paralielism != "tp-cp-ep-dp-pp":
-            raise ValueError(f"Invalid order_of_paralielism, we only support tp-cp-ep-dp-pp now, but got {self.order_of_paralielism}")
+        self._validate_order_of_paralielism()
         assert self.cp_a2a_mode in self.valid_cp_a2a_modes, (
             f"cp_a2a_mode {self.cp_a2a_mode} must be in [{','.join(self.valid_cp_a2a_modes)}]"
         )

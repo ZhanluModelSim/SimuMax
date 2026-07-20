@@ -168,6 +168,17 @@ Controls the number of layers contained in the first and last Pipeline Parallel 
 ### interleaving_size
 Virtual pipeline size. Keep it at `1` for the first working strategy.
 When `interleaving_size > 1`, `pp_size` must also be greater than `1`.
+### order_of_paralielism
+Placement of the dense parallel dims across the machine hierarchy, innermost
+first, default `"tp-cp-ep-dp-pp"` (today's hardcoded mesh). Grammar:
+`-`-separated tokens with exactly one each of `tp`/`cp`/`dp` in any order,
+optional `ep` tokens anywhere (dropped — the MoE mesh placement is fixed),
+and an optional trailing `pp` (`pp`, when present, must be outermost).
+Examples: `"tp-cp-ep-dp-pp"` (default) vs `"cp-tp-ep-dp-pp"` (cp innermost).
+It drives the group composition / stride math used by the levels cost path
+and net placement of the hierarchical network model. Constraints: `pp` is
+always outermost; the `ep`/MoE mesh placement is fixed. See
+`docs/design_simu_hierarchical_network.md` section 4.
 ### zero_state
 ZeRO optimization configuration, currently only supports zero0 and zero1, default is 1
 
