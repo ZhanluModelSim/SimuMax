@@ -143,9 +143,11 @@ no-op).
 ## 5. Shape Dimensions for Non-GEMM Ops
 
 - `sdp_fwd` / `sdp_bwd`: attention modules (CoreAttention, MLA variants)
-  build a shape_desc like
-  `b=, s_q=, s_kv=, h_q=, h_kv=, d=, causal=` so flash-attention
-  efficiency can be measured and keyed per shape (seq_len-sensitive).
+  build a shape_desc in the shipped measurement format
+  `batch=, seq_len=, head_num=, kv_head_num=, qk_head_dim=, v_head_dim=, qkv_contiguous=`
+  — the same key `simu_tools/efficency_test/test_fa_efficiency.py`
+  emits — so flash-attention efficiency can be measured and keyed per
+  shape (seq_len-sensitive) and pasted back without translation.
 - Elementwise / norm ops (currently `default` op): a light
   `b=, s=, h=` descriptor; class_key-level tuning already covers most of
   the need, shapes are optional refinement.

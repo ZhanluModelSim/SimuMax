@@ -125,8 +125,11 @@ no-op）。
 ## 5. 非 GEMM 算子的 shape 维度
 
 - `sdp_fwd` / `sdp_bwd`：注意力模块（CoreAttention、MLA 变体）构建
-  形如 `b=, s_q=, s_kv=, h_q=, h_kv=, d=, causal=` 的 shape_desc，
-  使 flash-attention 效率可按 shape（seq_len 敏感）测量与键控。
+  采用已交付实测格式的 shape_desc：
+  `batch=, seq_len=, head_num=, kv_head_num=, qk_head_dim=, v_head_dim=, qkv_contiguous=`
+  ——与 `simu_tools/efficency_test/test_fa_efficiency.py` 生成的
+  key 相同——使 flash-attention 效率可按 shape（seq_len 敏感）
+  测量与键控，且实测条目无需转换即可粘贴回去。
 - elementwise / norm 类（现为 `default` op）：轻量 `b=, s=, h=`
   描述符；class_key 级调整已覆盖大部分需求，shape 级为可选细化。
 - 现有 `accurate_efficient_factor[(op_name, shape_desc)]` 在第 5 级

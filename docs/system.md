@@ -484,6 +484,26 @@ entries:
 }
 ```
 
+### Shape descriptors
+
+Per-shape entries (`shapes` blocks and the level-1/3/5 lookups) are
+keyed by the shape descriptor each module emits at runtime. The
+formats currently produced are:
+
+- GEMM (LinearBase subclasses): the existing
+  `b=, m=, k=, n=, layout=, accumulate=, out_dtype=` format, e.g.
+  `b=1, m=4096, k=8192, n=10240, layout=TN, accumulate=False, out_dtype=bf16`.
+- sdp / attention (CoreAttention, MLA variants):
+  `batch=, seq_len=, head_num=, kv_head_num=, qk_head_dim=, v_head_dim=, qkv_contiguous=`,
+  e.g. `batch=1, seq_len=4096, head_num=32, kv_head_num=8, qk_head_dim=128, v_head_dim=128, qkv_contiguous=True`.
+  This is exactly the shape key that
+  `simu_tools/efficency_test/test_fa_efficiency.py` emits, so measured
+  entries paste back verbatim and actually hit.
+- elementwise / norm ops that cost as the `default` op (LayerNorm,
+  Swiglu, Gelu): a light `b=, s=, h=` descriptor, e.g.
+  `b=1, s=4096, h=8192`. `h` is the hidden size for LayerNorm and the
+  ffn/intermediate dim the activation operates on for Swiglu/Gelu.
+
 ### Lookup chain
 
 At cost time the first hit wins:
@@ -519,3 +539,11 @@ measure the named operator with
 [simu_tools/efficency_test](../simu_tools/efficency_test/README.md) →
 paste the result into `operator_efficiency` (or into
 `accurate_efficient_factor` for op-name-level entries).
+
+Because modules now emit their shape descriptors at runtime, sdp
+misses recorded in `miss_efficiency` carry real shape keys in exactly
+the format `test_fa_efficiency.py` benchmarks: copy a missed sdp shape
+key into the measurement script's shape list, run it, and paste the
+resulting entry back into `accurate_efficient_factor` (or a `shapes`
+override) — the simulator will produce the identical key on the next
+run, so the measured value is guaranteed to hit.

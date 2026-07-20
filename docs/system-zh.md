@@ -476,6 +476,24 @@ Phase 1）。用于在不改动共享的、按 op 名组织的
 }
 ```
 
+### Shape 描述符
+
+逐 shape 条目（`shapes` 块以及第 1/3/5 级查找）以各模块在运行时
+生成的 shape 描述符为键。当前产生的格式有：
+
+- GEMM（LinearBase 子类）：现有的
+  `b=, m=, k=, n=, layout=, accumulate=, out_dtype=` 格式，例如
+  `b=1, m=4096, k=8192, n=10240, layout=TN, accumulate=False, out_dtype=bf16`。
+- sdp / 注意力（CoreAttention、MLA 变体）：
+  `batch=, seq_len=, head_num=, kv_head_num=, qk_head_dim=, v_head_dim=, qkv_contiguous=`，
+  例如 `batch=1, seq_len=4096, head_num=32, kv_head_num=8, qk_head_dim=128, v_head_dim=128, qkv_contiguous=True`。
+  这与 `simu_tools/efficency_test/test_fa_efficiency.py` 生成的
+  shape key 完全一致，因此实测条目可以原样粘贴回去并真正命中。
+- 以 `default` op 计成本的 elementwise / norm 算子（LayerNorm、
+  Swiglu、Gelu）：轻量 `b=, s=, h=` 描述符，例如
+  `b=1, s=4096, h=8192`。其中 `h` 对 LayerNorm 是 hidden size，
+  对 Swiglu/Gelu 是其所作用的 ffn/中间维度。
+
 ### 查找链
 
 成本计算时首个命中的生效：
@@ -508,3 +526,10 @@ key 会抛出 `ValueError`，而不是静默无效。
 [simu_tools/efficency_test](../simu_tools/efficency_test/README.md)
 实测被点名的算子 → 把结果填入 `operator_efficiency`（op 名级别的条目则填入
 `accurate_efficient_factor`）。
+
+由于模块现在会在运行时生成 shape 描述符，`miss_efficiency` 中记录的
+sdp 未命中带有真实 shape key，格式与 `test_fa_efficiency.py` 的实测
+格式完全一致：把未命中的 sdp shape key 复制到测量脚本的 shape 列表中
+运行，再把得到的条目粘贴回 `accurate_efficient_factor`（或某个
+`shapes` override）——模拟器下次运行会产生完全相同的 key，实测值
+必然命中。

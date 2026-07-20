@@ -884,6 +884,12 @@ class LayerNorm(MetaModule):
         hidden_size = self.input_info.tensors[0].size(2)
         assert self.norm_size == hidden_size
 
+    def get_input_shapes_desc(self, stage):
+        # Light elementwise descriptor; enables (class_key, shape)
+        # efficiency overrides for this non-GEMM op.
+        batch, seq_len, hidden_size = self.input_info.tensors[0].shape[:3]
+        return f"b={int(batch)}, s={int(seq_len)}, h={int(hidden_size)}"
+
     def _comp_leaf_intra_net_info(self):
         pass
 
@@ -1183,7 +1189,10 @@ class CoreAttention(MetaModule):
         else:
             head_num = self.head_num
             kv_head_num = self.kv_head_num
-        qkv_contiguous = False if 's5000' in self.system.sys_name else True # TODO(sherry): get qkv_contiguous by input stride
+        # Megatron packs QKV into one contiguous tensor, so the FA kernel gets
+        # contiguous qkv; s5000 systems were measured with non-contiguous qkv.
+        # TODO(sherry): get qkv_contiguous by input stride
+        qkv_contiguous = False if 's5000' in self.system.sys_name else True
         shape_str = f'batch={int(batch)}, seq_len={int(seq_len)}, head_num={int(head_num)}, kv_head_num={int(kv_head_num)}, qk_head_dim={int(self.head_size)}, v_head_dim={int(self.v_head_dim)}, qkv_contiguous={qkv_contiguous}'
         return shape_str
 
@@ -1968,6 +1977,18 @@ class Swiglu(MetaModule):
     def _pre_op(self):
         self._act_info.checkpoint_mem = self.micro_hidden_state_size * self.element_size
 
+    def get_input_shapes_desc(self, stage):
+        # Light elementwise descriptor; enables (class_key, shape)
+        # efficiency overrides for this non-GEMM op.
+        shape = self.input_info.tensors[0].shape
+        if len(shape) >= 3:  # [B, S, 2*ffn]
+            batch, seq_len = shape[0], shape[1]
+        else:  # flattened tokens, e.g. MoE [tokens, 2*ffn]
+            batch, seq_len = 1, shape[0]
+        # gate/up are concatenated on the last dim; the op works on the ffn dim
+        ffn_dim = shape[-1] // 2
+        return f"b={int(batch)}, s={int(seq_len)}, h={int(ffn_dim)}"
+
     def _comp_leaf_intra_net_info(self):
         pass
 
@@ -2084,6 +2105,16 @@ class Gelu(MetaModule):
 
     def _pre_op(self):
         self._act_info.checkpoint_mem = self.micro_hidden_state_size * self.element_size
+
+    def get_input_shapes_desc(self, stage):
+        # Light elementwise descriptor; enables (class_key, shape)
+        # efficiency overrides for this non-GEMM op.
+        shape = self.input_info.tensors[0].shape
+        if len(shape) >= 3:  # [B, S, H]
+            batch, seq_len = shape[0], shape[1]
+        else:  # flattened tokens [B*S, H]
+            batch, seq_len = 1, shape[0]
+        return f"b={int(batch)}, s={int(seq_len)}, h={int(shape[-1])}"
 
     def _comp_leaf_intra_net_info(self):
         pass
