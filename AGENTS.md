@@ -100,8 +100,10 @@ Key characteristics:
   `release_v1.2.md`, `b200/`). Design proposals also live here, e.g.
   `design_simu_kind_resource_model.md` (+ `-zh` mirror) for the
   `simu_kind` / resource-lane / fused-op rework of the `simulate()` DES
-  path (implemented), and `design_simu_network_fabric.md` (+ `-zh` mirror)
-  for planned NIC-level cross-node contention modeling.
+  path (implemented), `design_simu_network_fabric.md` (+ `-zh` mirror)
+  for NIC-level cross-node contention modeling (implemented), and
+  `design_simu_cost_model_tunability.md` (+ `-zh` mirror) for planned
+  per-operator cost-model tunability and declarative model recipes.
 
 ## Build / Install / Run
 

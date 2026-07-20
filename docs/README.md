@@ -74,3 +74,7 @@ Recommended order:
   ([中文版本](./design_simu_network_fabric-zh.md)) — per-GPU NIC
   contention, both-end p2p charging, and topology-aware cost corrections
   for cross-node communication in the DES.
+- [design_simu_cost_model_tunability.md](./design_simu_cost_model_tunability.md)
+  ([中文版本](./design_simu_cost_model_tunability-zh.md)) — per-operator
+  efficiency keys (class + path), declarative model recipe, and
+  non-GEMM shape dimensions for the cost model.
