@@ -75,6 +75,55 @@ class ParameterExtractor:
         else:
             print(f"Warning: parameter {param_name} not found, use default {default}")
             return default
+
+
+def _validate_efficiency_override_table(table, field_name):
+    """Validate one per-operator efficiency table (cost-tunability design doc 4).
+
+    Grammar per key (class_key or path_key): either a scalar efficiency in
+    (0, 1], or a dict ``{"default": float, "shapes": {shape_desc: float}}``
+    where "shapes" is optional. Raises AssertionError on invalid grammars.
+    """
+    if table is None:
+        return
+    assert isinstance(table, dict), (
+        f"{field_name} must be a dict of key -> efficiency, but got {type(table)}"
+    )
+
+    def _check_eff(value, ctx):
+        assert (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and 0 < value <= 1
+        ), f"{ctx} must be a number in (0, 1], but got {value!r}"
+
+    for key, value in table.items():
+        assert isinstance(key, str) and key, (
+            f"{field_name} keys must be non-empty str, but got {key!r}"
+        )
+        ctx = f"{field_name}[{key!r}]"
+        if not isinstance(value, dict):
+            _check_eff(value, ctx)
+            continue
+        unknown_keys = set(value) - {"default", "shapes"}
+        assert not unknown_keys, (
+            f"{ctx} has unknown keys {sorted(unknown_keys)}, "
+            "allowed keys are ['default', 'shapes']"
+        )
+        assert "default" in value, f"{ctx} must contain a 'default' entry"
+        _check_eff(value["default"], f"{ctx}['default']")
+        shapes = value.get("shapes")
+        if shapes is not None:
+            assert isinstance(shapes, dict), (
+                f"{ctx}['shapes'] must be a dict of shape_desc -> efficiency, "
+                f"but got {type(shapes)}"
+            )
+            for shape_desc, eff in shapes.items():
+                assert isinstance(shape_desc, str), (
+                    f"{ctx}['shapes'] keys must be str, but got {shape_desc!r}"
+                )
+                _check_eff(eff, f"{ctx}['shapes'][{shape_desc!r}]")
+
 @dataclass
 class Config:
     """
@@ -313,6 +362,11 @@ class StrategyConfig(Config):
     fused_ops: Optional[List[dict]] = None
     # Fused-op memory accounting mode (design doc 4.7/9.2); "ramp" is reserved.
     fused_mem_mode: str = "steady_state"
+
+    # Per-operator efficiency overrides (cost-tunability design doc section 4):
+    # temporary what-if adjustments that win over SystemConfig.operator_efficiency
+    # and lose to the API-level overrides. Same grammar as operator_efficiency.
+    efficiency_overrides: Optional[Dict[str, Any]] = None
 
     mem_factor: float = 0.94
     
@@ -762,6 +816,8 @@ class StrategyConfig(Config):
                 "steady_state is used."
             )
             self.fused_mem_mode = "steady_state"
+
+        _validate_efficiency_override_table(self.efficiency_overrides, "efficiency_overrides")
     def reset_global_batch_size(self, global_batch_size):
         assert global_batch_size % (self.dp_size * self.micro_batch_size)==0, f"global_batch_size {global_batch_size} must be divisible by dp_size*miro_batch_size(dp_size={self.dp_size}, micro_batch_size={self.micro_batch_size})"
         self.micro_batch_num = global_batch_size // (self.dp_size * self.micro_batch_size)
@@ -840,6 +896,17 @@ class SystemConfig(Config):
     # Fabric topology knobs; reserved keys are "tor_capacity_gbps"
     # (number) and "tor_node_share" ("auto" or number >= 1).
     topology: Optional[Dict[str, Any]] = None
+    # Machine-level per-operator efficiency table (cost-tunability design doc
+    # section 4). Grammar per key (class_key or path_key): a scalar in (0, 1],
+    # or {"default": float, "shapes": {shape_desc: float}} ("shapes" optional).
+    operator_efficiency: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        # Runtime override-chain slots, populated by PerfLLM.configure()
+        # (cost-tunability design doc section 3). Plain attributes, not
+        # dataclass fields: they never serialize into to_dict().
+        self.efficiency_overrides_strategy = None
+        self.efficiency_overrides_api = None
 
     @classmethod
     def init_from_dict(cls, config_dict: Dict[str, Any]):
@@ -868,6 +935,7 @@ class SystemConfig(Config):
         engines = config_dict.pop("engines", None)
         fabric_model = config_dict.pop("fabric_model", None)
         topology = config_dict.pop("topology", None)
+        operator_efficiency = config_dict.pop("operator_efficiency", None)
         return cls(
             sys_name=sys_name,
             num_per_node=num_per_node,
@@ -878,6 +946,7 @@ class SystemConfig(Config):
             engines=engines,
             fabric_model=fabric_model,
             topology=topology,
+            operator_efficiency=operator_efficiency,
         )
     
     def record_miss_efficiency(self, op_name:str, flops:int, shape_desc:str, use_eff):
@@ -893,32 +962,154 @@ class SystemConfig(Config):
             self.real_comm_bw[op_name] = {}
         self.real_comm_bw[op_name][comm_stage.lower()] = {"net":net, "base_bw":base_bw, "real_bw":real_bw, "eff_factor":eff_factor, "comm_num":comm_num, "comm_size":comm_size, "total_time":total_time, "latency": latency, "FC8":self.FC8} 
 
-    def record_hit_efficiency(self, op_name:str, flops:int, shape_desc:str, eff):
+    def record_hit_efficiency(
+        self, op_name: str, flops: int, shape_desc: str, eff, path_key=None, level=None
+    ):
         if op_name not in self.hit_efficiency:
             self.hit_efficiency[op_name] = {}
-        self.hit_efficiency[op_name][shape_desc] = (flops, eff)
+        if path_key is None and level is None:
+            # Legacy record shape, kept byte-identical for the no-override path.
+            self.hit_efficiency[op_name][shape_desc] = (flops, eff)
+        else:
+            # Override-chain hit (cost-tunability design doc section 3):
+            # attribute the winning key level and source.
+            self.hit_efficiency[op_name][shape_desc] = {
+                'flops': flops,
+                'eff': eff,
+                'path_key': path_key,
+                'level': level,
+            }
+
+    def _lookup_efficiency_override(self, class_key, path_key, shape_desc):
+        """Resolve the per-operator efficiency override chain (design doc 3).
+
+        Key levels are checked in order, first hit wins:
+        (path_key, shape_desc) > path_key > (class_key, shape_desc) > class_key.
+        Path keys use prefix semantics: "layer_0.mlp" covers the whole
+        subtree, longest matching prefix wins.
+        Within one key level the source precedence is
+        efficiency_overrides_api > efficiency_overrides_strategy >
+        operator_efficiency. A scalar entry applies at both the (key, shape)
+        and the key level; a dict entry resolves to shapes[shape_desc] at the
+        (key, shape) level (shape_desc may be "") and to its "default" at the
+        key level.
+
+        Returns (efficiency, level_label) on hit, (None, None) on miss.
+        level_label is "<source>:<path|class>[+shape]", e.g. "api:path+shape",
+        "strategy:class", "system:class+shape".
+        """
+        sources = (
+            ("api", self.efficiency_overrides_api),
+            ("strategy", self.efficiency_overrides_strategy),
+            ("system", self.operator_efficiency),
+        )
+        # Path keys use prefix semantics: an override on "layer_0.mlp"
+        # applies to the whole subtree (e.g. "layer_0.mlp.linear_fc1").
+        # The longest matching prefix wins; ties break api > strategy >
+        # system. Sub-levels keep the design order: (path, shape) first,
+        # then the path-level default.
+        if path_key is not None:
+            matches = []
+            for src_rank, (src_label, table) in enumerate(sources):
+                if not table:
+                    continue
+                for key, value in table.items():
+                    if path_key == key or path_key.startswith(key + "."):
+                        matches.append((key, src_rank, src_label, value))
+            if matches:
+                matches.sort(key=lambda m: (-len(m[0]), m[1]))
+                for _, _, src_label, value in matches:
+                    eff = (value.get("shapes") or {}).get(shape_desc) \
+                        if isinstance(value, dict) else value
+                    if eff is not None:
+                        return eff, f"{src_label}:path+shape"
+                for _, _, src_label, value in matches:
+                    eff = value.get("default") if isinstance(value, dict) else value
+                    if eff is not None:
+                        return eff, f"{src_label}:path"
+        # Class keys are exact-match.
+        for key, kind in ((class_key, "class"),):
+            if key is None:
+                continue
+            entries = [
+                (src_label, table[key])
+                for src_label, table in sources
+                if table and key in table
+            ]
+            if not entries:
+                continue
+            # (key, shape) level: scalar applies directly; dict needs a
+            # matching shapes entry.
+            for src_label, value in entries:
+                if isinstance(value, dict):
+                    eff = (value.get("shapes") or {}).get(shape_desc)
+                else:
+                    eff = value
+                if eff is not None:
+                    return eff, f"{src_label}:{kind}+shape"
+            # key level: scalar applies directly; dict yields its default.
+            for src_label, value in entries:
+                if isinstance(value, dict):
+                    eff = value.get("default")
+                else:
+                    eff = value
+                if eff is not None:
+                    return eff, f"{src_label}:{kind}"
+        return None, None
+
+    def validate_efficiency_override_keys(self, known_keys: set) -> list:
+        """Return the sorted override keys that match no known class_key or
+        path_key (design doc 4: unknown keys must raise at configure time).
+        Path keys additionally match when they are an ancestor prefix of a
+        known path (e.g. "layer_0.mlp" covers "layer_0.mlp.linear_fc1").
+        Checks operator_efficiency and both runtime override dicts.
+        """
+        def _known(key):
+            if key in known_keys:
+                return True
+            prefix = key + "."
+            return any(k.startswith(prefix) for k in known_keys)
+
+        unknown = set()
+        for table in (
+            self.operator_efficiency,
+            self.efficiency_overrides_strategy,
+            self.efficiency_overrides_api,
+        ):
+            if not table:
+                continue
+            unknown.update(key for key in table if not _known(key))
+        return sorted(unknown)
 
     def reset_record_info(self):
         self.miss_efficiency.clear()
         self.hit_efficiency.clear()
         self.real_comm_bw.clear()
 
-    def compute_op_accuracy_time(self, op_name:str, flops:int, shape_desc:str, reture_detail=False):
+    def compute_op_accuracy_time(
+        self, op_name: str, flops: int, shape_desc: str, reture_detail=False,
+        class_key=None, path_key=None,
+    ):
         """
         compute float point operation time,
         return time in ms
 
-        matmul_input_shapes: list of input shapes, e.g. "[1, 16384, 4096] x [1, 4096, 128256]" 
+        matmul_input_shapes: list of input shapes, e.g. "[1, 16384, 4096] x [1, 4096, 128256]"
+
+        class_key/path_key enable the per-operator efficiency override chain
+        (cost-tunability design doc section 3, levels 1-4). When both are None
+        the override block is skipped entirely and the behavior (time and
+        miss/hit records) is identical to the legacy lookup (levels 5-7).
         """
         if flops == 0:
             if reture_detail:
-                return dict(op_name=op_name, 
-                                tflops=None, 
+                return dict(op_name=op_name,
+                                tflops=None,
                                 efficient_factor=None,
                                 compute_only_time = 0.0)
             else:
                 return 0
-            
+
         op = self.accelerator.op.get(op_name, None)
         if op is None:
             warnings.warn(
@@ -927,6 +1118,39 @@ class SystemConfig(Config):
             op = self.accelerator.op.get("default", None)
             assert op is not None, f"default not exist on {self.accelerator.op}"
             self.record_miss_efficiency(op_name, flops, shape_desc, None)
+
+        if class_key is not None or path_key is not None:
+            override_eff, override_level = self._lookup_efficiency_override(
+                class_key, path_key, shape_desc
+            )
+            if override_eff is not None:
+                efficient_factor = override_eff
+                # Key-grouped hit record: attribute the class_key (not the
+                # coarse op_name) plus the winning path_key and chain level.
+                self.record_hit_efficiency(
+                    class_key if class_key is not None else path_key,
+                    flops,
+                    shape_desc,
+                    efficient_factor,
+                    path_key=path_key,
+                    level=override_level,
+                )
+                if SIMU_DEBUG:
+                    print(
+                        f"=== \033[32m{op_name} ({class_key}/{path_key}) input shape "
+                        f"{shape_desc} use override compute efficient factor "
+                        f"{efficient_factor} [{override_level}]\033[0m, flops={flops}"
+                    )
+                time = flops / (op.tflops * 1e12 * efficient_factor) * 1e3
+                if reture_detail:
+                    return dict(op_name=op_name,
+                                tflops=op.tflops,
+                                efficient_factor=efficient_factor,
+                                compute_only_time = time)
+                else:
+                    return time
+            # Override miss: fall through to the legacy levels 5-7 below with
+            # the existing record calls unchanged.
 
         if ( op.accurate_efficient_factor is not None ) and \
         (op.accurate_efficient_factor.get(shape_desc, None) is not None):
@@ -1182,6 +1406,10 @@ class SystemConfig(Config):
     def sanity_check(self):
         self._sanity_check_engines()
         self._sanity_check_fabric()
+        self._sanity_check_operator_efficiency()
+
+    def _sanity_check_operator_efficiency(self):
+        _validate_efficiency_override_table(self.operator_efficiency, "operator_efficiency")
 
     def _sanity_check_engines(self):
         if self.engines is None:

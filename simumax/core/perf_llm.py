@@ -11,7 +11,7 @@ from typing import List, Union, Dict, Tuple
 from sympy import divisors
 from pprint import pprint
 import pandas as pd
-from simumax.core.base_struct import PathDebugContext, RecomputeStatus
+from simumax.core.base_struct import MetaModule, PathDebugContext, RecomputeStatus
 from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.model_struct import ActivationInfo
@@ -303,10 +303,16 @@ class PerfBase(ABC):
         system_config: Union[SystemConfig, str] = None,
         debug_points: List[str] = None,
         debug_points_last_stage=None,
+        efficiency_overrides: dict = None,
     ):
         """
         Configure the performance model, including strategy, model and system config.
         And check the sanity of the configuration.
+
+        Args:
+            efficiency_overrides: optional per-operator efficiency overrides
+                (class_key or path_key -> scalar or {"default", "shapes"}),
+                highest precedence over strategy/system efficiency settings.
         """
         if not isinstance(strategy_config, StrategyConfig):
             strategy_config = StrategyConfig.init_from_config_file(strategy_config)
@@ -320,6 +326,13 @@ class PerfBase(ABC):
         if not isinstance(system_config, SystemConfig):
             system_config = SystemConfig.init_from_config_file(system_config)
         self._set_system_config(system_config)
+
+        # Wire the efficiency-override chain onto the system config, which
+        # performs the actual lookup during cost computation.
+        self.system.efficiency_overrides_strategy = getattr(
+            self.strategy, "efficiency_overrides", None
+        )
+        self.system.efficiency_overrides_api = efficiency_overrides
         
 
         self.debug_points = debug_points if debug_points is not None else []
@@ -457,10 +470,70 @@ class PerfBase(ABC):
         )
         self.analysis_net(re_analysis = True)
         self.build()
+        self._validate_efficiency_override_keys()
         if capture_graph:
             self.graph = self.capture(save_path)
 
         self._run()
+
+    def _collect_known_cost_keys(self):
+        """Gather all valid efficiency-override keys from the built module trees.
+
+        A key is valid if it matches a module's class name, its explicit
+        ``cost_op_key`` (when set), or its path key (``full_name`` without the
+        leading ``self.`` prefix).
+        """
+        known = set()
+        visited = set()
+
+        def walk(module):
+            if id(module) in visited:
+                return
+            visited.add(id(module))
+            known.add(type(module).__name__)
+            cost_op_key = getattr(module, "cost_op_key", None)
+            if cost_op_key:
+                known.add(cost_op_key)
+            full_name = getattr(module, "full_name", "") or ""
+            if full_name.startswith("self."):
+                known.add(full_name[len("self."):])
+            elif full_name:
+                known.add(full_name)
+            for name, member in vars(module).items():
+                if name == "parent_module":
+                    continue
+                if isinstance(member, MetaModule):
+                    walk(member)
+                elif isinstance(member, (list, tuple)):
+                    for item in member:
+                        if isinstance(item, MetaModule):
+                            walk(item)
+                elif isinstance(member, dict):
+                    for item in member.values():
+                        if isinstance(item, MetaModule):
+                            walk(item)
+
+        chunk_dicts = (
+            getattr(self, "model_chunk_dict", None),
+            getattr(self, "vpp_chunk_dict", None),
+        )
+        for chunk_dict in chunk_dicts:
+            if not chunk_dict:
+                continue
+            for chunk in chunk_dict.values():
+                if isinstance(chunk, MetaModule):
+                    walk(chunk)
+        return known
+
+    def _validate_efficiency_override_keys(self):
+        """Fail fast on efficiency-override keys that match no built module."""
+        validate = getattr(self.system, "validate_efficiency_override_keys", None)
+        if validate is None:
+            return
+        bad = validate(self._collect_known_cost_keys())
+        if bad:
+            raise ValueError(f"efficiency override keys matched no module: {bad}")
+
 class PerfLLM(PerfBase):
 
     """Performance model for LLM"""
@@ -1394,6 +1467,7 @@ class PerfLLM(PerfBase):
         system_config: Union[SystemConfig, str] = None,
         debug_points: List[str] = None,
         debug_points_last_stage=None,
+        efficiency_overrides: dict = None,
     ):
         super().configure(
             strategy_config=strategy_config,
@@ -1401,6 +1475,7 @@ class PerfLLM(PerfBase):
             system_config=system_config,
             debug_points=debug_points,
             debug_points_last_stage=debug_points_last_stage,
+            efficiency_overrides=efficiency_overrides,
         )
         self._chunk_profile_model_key = json.dumps(
             self.model_config.to_dict(), sort_keys=True

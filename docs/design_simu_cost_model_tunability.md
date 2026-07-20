@@ -84,7 +84,10 @@ Every module instance gets:
   e.g. `layer_3.mlp`, `layer_3.attention.q_proj`. Computed during the
   fake-forward from the existing parent/child tree (the same tree that
   already renders `peak_path`); the model-root prefix is dropped for
-  brevity.
+  brevity. Path keys use **prefix semantics**: an override on
+  `layer_3.mlp` applies to the whole subtree (`layer_3.mlp.linear_fc1`,
+  ...); the longest matching prefix wins, ties break
+  API > strategy > system.
 
 Efficiency lookup order at `compute_op_accuracy_time` time (first hit
 wins, miss falls through):

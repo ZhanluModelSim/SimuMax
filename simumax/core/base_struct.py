@@ -331,6 +331,10 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self.full_name = "self"
         self.name = ''
         self.call_idx = -1
+        # Instance-level override hook for cost-model efficiency lookup:
+        # a module class or user may set this to a string to replace the
+        # default class-name-based key (see get_cost_keys).
+        self.cost_op_key = None
 
         # for Selective recompute strategy
         self.all_recompute_nodes:List[MetaModule] = []
@@ -371,6 +375,13 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             child.full_name = parent_name + '.' + name
             child.name = name
             child.set_leaf_full_name(child.full_name)
+
+    def get_cost_keys(self):
+        """(class_key, path_key) for cost-model efficiency lookup."""
+        class_key = self.cost_op_key or type(self).__name__
+        full = getattr(self, "full_name", "") or ""
+        path_key = full[5:] if full.startswith("self.") else (full or None)
+        return class_key, path_key
     
     def _reset_infos(self):
         self._act_info = ActivationInfo()
@@ -852,7 +863,8 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     ):
         def compute_details(op_name, stage, flops, accessed_mem):
             #compute_details include compute time, tflops of accelerator, flops of current op, etc.
-            compute_details = self.system.compute_op_accuracy_time(op_name, flops, shape_desc= self.get_input_shapes_desc(stage), reture_detail=True)
+            class_key, path_key = self.get_cost_keys()
+            compute_details = self.system.compute_op_accuracy_time(op_name, flops, shape_desc= self.get_input_shapes_desc(stage), reture_detail=True, class_key=class_key, path_key=path_key)
 
             # io_details include io time, gbps of accelerator, io size of current op, etc.
             io_details = self.system.compute_mem_access_time(op_name,

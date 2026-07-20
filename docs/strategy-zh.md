@@ -290,3 +290,32 @@ DES 中本地集合通信的跨 rank skew 模型（见
 放大每个本地集合通信的完成时间——确定性的、节点粒度的 skew。它只影响
 DES `simulate()` 路径；而 `enable_straggler_model` 缩放的是解析估计
 `run_estimate()` 的结果。
+
+## 效率覆盖（可选）
+
+### efficiency_overrides
+用于临时 what-if 调优的按算子效率覆盖（
+[design_simu_cost_model_tunability-zh.md](./design_simu_cost_model_tunability-zh.md)
+Phase 1）。key 语法与
+[system-zh.md](./system-zh.md#operator_efficiency可选) 中的
+`operator_efficiency` 相同：class key（如 `"LinearCol"`）或 path key
+（如 `"layer_3.mlp"`），值为标量或 `{"default", "shapes"}` 字典。
+
+例如，只调第 3 层的 MLP：
+
+```json
+"efficiency_overrides": {
+    "layer_3.mlp": 0.48
+}
+```
+
+优先级（从高到低）：
+
+1. 通过 `PerfBase.configure(..., efficiency_overrides={...})` 传入的
+   API overrides
+2. strategy 的 `efficiency_overrides`（本字段）
+3. system 的 `operator_efficiency`
+
+strategy/API overrides 适合临时调优；实测得到的稳定值应写入
+`system.json`。key 会在 `run_estimate()` 构建模型后校验，匹配不到任何
+模块的 key 会抛出 `ValueError`。

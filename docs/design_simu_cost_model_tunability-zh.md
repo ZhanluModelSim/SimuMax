@@ -68,7 +68,10 @@
   `"ExpertMLP"`），可通过新的 `cost_op_key` 属性按实例覆写。
 - **path_key**：从模型根节点出发的属性路径点接，如 `layer_3.mlp`、
   `layer_3.attention.q_proj`。fake-forward 时沿现有父子树计算（与
-  `peak_path` 同一棵树）；根前缀省略以保持简短。
+  `peak_path` 同一棵树）；根前缀省略以保持简短。路径键采用**前缀
+  语义**：`layer_3.mlp` 上的覆盖作用于整个子树
+  （`layer_3.mlp.linear_fc1` 等）；最长匹配前缀优先，并列时按
+  API > strategy > system。
 
 效率查找顺序（首中即止，未中下落）：
 

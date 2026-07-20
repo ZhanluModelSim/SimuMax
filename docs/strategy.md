@@ -302,3 +302,34 @@ collective's completion by
 a deterministic, node-granularity skew. It only affects the DES
 `simulate()` path, unlike `enable_straggler_model` which scales the
 analytical `run_estimate()` result.
+
+## Efficiency Overrides (optional)
+
+### efficiency_overrides
+Per-operator efficiency overrides for temporary what-if tuning (Phase 1
+of
+[design_simu_cost_model_tunability.md](./design_simu_cost_model_tunability.md)).
+Same key grammar as `operator_efficiency` in
+[system.md](./system.md#operator_efficiency-optional): a class key
+(e.g. `"LinearCol"`) or a path key (e.g. `"layer_3.mlp"`) mapping to a
+scalar or a `{"default", "shapes"}` dict.
+
+For example, tuning only the MLP of layer 3:
+
+```json
+"efficiency_overrides": {
+    "layer_3.mlp": 0.48
+}
+```
+
+Precedence, highest first:
+
+1. API overrides passed as
+   `PerfBase.configure(..., efficiency_overrides={...})`
+2. strategy `efficiency_overrides` (this field)
+3. system `operator_efficiency`
+
+Strategy/API overrides are meant for temporary tuning; measured, durable
+values belong in `system.json`. Keys are validated against the built
+model at `run_estimate()` time, and a key that matches no module raises
+`ValueError`.

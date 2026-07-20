@@ -455,3 +455,67 @@ Optional fields enabling the network-fabric contention model of the DES
   the node's real traffic) and to `1` otherwise.
 - `topology` is only meaningful together with `fabric_model`; setting it
   while `fabric_model` is absent triggers a warning.
+
+## operator_efficiency (optional)
+
+Optional per-operator efficiency table for the analytical cost model
+(Phase 1 of
+[design_simu_cost_model_tunability.md](./design_simu_cost_model_tunability.md)).
+It tunes the efficiency of individual operators without touching the
+shared, op-name-level `accurate_efficient_factor` entries.
+
+Each key is either a **class key** (a module class name such as
+`"LinearCol"` or `"ParallelCE"`, or the instance-level `cost_op_key`
+when set) or a **path key** (the module path from the model root, e.g.
+`"layer_3.mlp"`). A key maps to either a scalar (the default efficiency
+for that key) or a dict with a `default` plus per-shape `shapes`
+entries:
+
+```json
+"operator_efficiency": {
+    "ParallelCE": 0.52,
+    "LinearCol": {
+        "default": 0.60,
+        "shapes": {
+            "b=1, m=4096, k=8192, n=10240, layout=TN, accumulate=False, out_dtype=bf16": 0.66
+        }
+    },
+    "layer_3.mlp": {"default": 0.55}
+}
+```
+
+### Lookup chain
+
+At cost time the first hit wins:
+
+| Level | Key | Source |
+|---|---|---|
+| 1 | `(path_key, shape_desc)` | overrides chain |
+| 2 | `path_key` | overrides chain |
+| 3 | `(class_key, shape_desc)` | overrides chain |
+| 4 | `class_key` | overrides chain |
+| 5 | `(op_name, shape_desc)` | `accurate_efficient_factor` (existing) |
+| 6 | `op_name` | `efficient_factor` (existing) |
+| 7 | `default` op | existing fallback |
+
+The "overrides chain" itself is, highest precedence first:
+
+1. API overrides — `PerfBase.configure(..., efficiency_overrides={...})`
+2. strategy `efficiency_overrides` (see
+   [strategy.md](./strategy.md#efficiency_overrides))
+3. system `operator_efficiency` (this field)
+
+Override keys are validated against the built model at `run_estimate()`
+time; a key that matches no module raises `ValueError` instead of
+silently doing nothing.
+
+### Hit / miss attribution and the measurement loop
+
+Every lookup records the winning level and source in `hit_efficiency`.
+Misses are recorded in `miss_efficiency`, grouped by class key / path
+key with their level labels, so the report directly names the operator
+to benchmark. The closed loop is: run → inspect `miss_efficiency` →
+measure the named operator with
+[simu_tools/efficency_test](../simu_tools/efficency_test/README.md) →
+paste the result into `operator_efficiency` (or into
+`accurate_efficient_factor` for op-name-level entries).
