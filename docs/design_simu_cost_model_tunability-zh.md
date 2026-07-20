@@ -6,7 +6,7 @@
 # 设计方案：负载接入与算子级成本模型独立可调
 
 - 状态：**v1.0（Phase 1-3 已实现）**
-- 实现记录：phase 1 `0463810`，phase 2 `ced8835`，phase 3 `TBD`
+- 实现记录：phase 1 `0463810`，phase 2 `ced8835`，phase 3 `3fb4c46`
 - 日期：2026-07-17
 - 范围：解析成本路径（`compute_op_accuracy_time`、
   `_comp_cost_info_impl`）、模块成本规格、model JSON 组合方式、测量
