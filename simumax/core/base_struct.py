@@ -2192,7 +2192,7 @@ class SimuContext:
                                       size_bytes=entry.meta.get("size_bytes", 0),
                                       crossed_levels=crossed)
         if self.threads_by_rank is not None and rank in self.threads_by_rank:
-            self.threads_by_rank[rank].t[entry.stream] = max(self.threads_by_rank[rank].t[entry.stream], end_t)
+            self.threads_by_rank[rank].t[entry.stream] = max(self.threads_by_rank[rank].t.get(entry.stream, 0.0), end_t)
         self.pending_comm_entry_completions.append(eid)
         self._maybe_finalize_async_ready(entry.gid)
         self._queue_async_finalize(entry.gid)
@@ -3004,6 +3004,276 @@ class send_prev(send):
         super().__init__(id, local_rank, group_size, com_buff, fwd_cost, bwd_cost, call_stk, **kwargs)
         if pp_size<=1:
             self.step = lambda *args:True
+
+
+class async_all_gather(LeafModel):
+    """Posts an all_gather CommEntry and yields WITHOUT blocking the comp lane.
+
+    Layer-wise FSDP unshard is split into a non-blocking post (this op) and a
+    blocking wait (``async_wait_collective``). The post issues the CommEntry,
+    pumps the comm queue so the AG runs on the comm lane, then returns
+    ``("yield_keep", gid)`` — the op stays queued and the rank is re-pushed,
+    so on retry it reports done (already posted) and the queue advances to the
+    next op (typically the block's compute), which starts on the comp lane
+    while the AG is in flight on the comm lane. ``yield_keep`` (not
+    ``yield_done``) is required because these posts sit inside a multi-op
+    FwdQue nested in the model's top FwdQue; ``yield_done`` would pop the head
+    and, when bubbled up to the outer FwdQue, drop the whole inner sub-queue.
+    The matching wait, placed later in the queue, re-syncs the comp lane to the
+    AG completion.
+
+    Issue logic mirrors ``Com._step`` (skip when cost==0 / group_size<=1;
+    backend_kind ``local`` under merge_lanes) but never blocks and never raises
+    ``t["comp"]``. See docs/design_simu_zero3_fsdp.md section 5.2.
+    """
+    simu_kind = "comm"
+
+    def __init__(self, id, rank, group_size, fwd_cost=0, global_rank=None,
+                 stream="comm", net=None, size_bytes=0, call_stk=''):
+        super().__init__()
+        self.call_stk = call_stk + f'-{self.__class__.__name__}'
+        self.id = id
+        self.rank = rank
+        self.group_size = group_size
+        self.fwd_cost = fwd_cost
+        self.bwd_cost = 0
+        self.global_rank = global_rank
+        self.stream = stream
+        # Resolved strategy net name + payload size, forwarded into the posted
+        # entry's meta; None keeps the entry out of fabric charging.
+        self.net = net
+        self.size_bytes = size_bytes
+        self._eid = None
+        self._posted = False
+
+    def _issue_meta(self):
+        return {"net": self.net, "size_bytes": self.size_bytes}
+
+    def _backend_kind(self, ctx):
+        expected = 2 if self.id.startswith("send_recv-") else self.group_size
+        if self.id.startswith("send_recv-"):
+            backend_kind = "p2p"
+        elif ctx.merge_lanes and 'default_group' not in self.id:
+            backend_kind = "local"
+        elif 'default_group' in self.id:
+            backend_kind = "barrier"
+            expected = int(self.id.split('pp_size:')[1])
+        else:
+            backend_kind = "barrier"
+        return backend_kind, expected
+
+    def _post(self, t, ctx, phase):
+        if self.global_rank is None:
+            raise RuntimeError(f"async_all_gather {self.id}: global_rank is None")
+        cost = self.fwd_cost if phase == "fwd" else self.bwd_cost
+        if cost == 0 or self.group_size <= 1:
+            return True, None
+        gid = (phase, self.id)
+        if self._posted:
+            return True, None
+        backend_kind, expected = self._backend_kind(ctx)
+        self._eid = ctx.issue_comm_entry(
+            rank=self.global_rank,
+            gid=gid,
+            cost=cost,
+            issue_t=t["comp"],
+            stream=self.stream,
+            mode="sync",
+            backend_kind=backend_kind,
+            expected=expected,
+            log_call_stk=self.call_stk,
+            log_id=self.id,
+            meta=self._issue_meta(),
+        )
+        # Faithful post marker (design doc 9.3): a zero-duration marker at the
+        # moment the op posts; the completion span is emitted by the wait.
+        ctx.event_sink.emit_span(
+            self.call_stk, phase, t["comp"], t["comp"],
+            gid=self.id, stream=self.stream,
+            kind="comm", lane=self.simu_lane,
+            name=self.call_stk.split("-")[-1] + "-post",
+        )
+        ctx.pump_comm_queue()
+        self._posted = True
+        return False, ("yield_keep", gid)
+
+    def _step(self, t, ctx):
+        return self._post(t, ctx, "fwd")
+
+    def _bwd(self, t, ctx):
+        return True, None
+
+    def step(self, t, ctx):
+        return self._step(t, ctx)
+
+    def bwd(self, t, ctx):
+        return self._bwd(t, ctx)
+
+    def prefill_fwd(self):
+        return self
+
+
+class async_reduce_scatter(LeafModel):
+    """Posts a reduce_scatter CommEntry and yields WITHOUT blocking the comp lane.
+
+    The layer-wise FSDP reshard mirror of ``async_all_gather``: the post runs
+    in backward (``bwd_cost``) so the RS overlaps with the previous block's
+    backward compute on the comp lane. Forward is a no-op (AG is fwd-only).
+    """
+    simu_kind = "comm"
+
+    def __init__(self, id, rank, group_size, bwd_cost=0, global_rank=None,
+                 stream="comm", net=None, size_bytes=0, call_stk=''):
+        super().__init__()
+        self.call_stk = call_stk + f'-{self.__class__.__name__}'
+        self.id = id
+        self.rank = rank
+        self.group_size = group_size
+        self.fwd_cost = 0
+        self.bwd_cost = bwd_cost
+        self.global_rank = global_rank
+        self.stream = stream
+        self.net = net
+        self.size_bytes = size_bytes
+        self._eid = None
+        self._posted = False
+
+    def _issue_meta(self):
+        return {"net": self.net, "size_bytes": self.size_bytes}
+
+    def _backend_kind(self, ctx):
+        return async_all_gather._backend_kind(self, ctx)
+
+    def _post(self, t, ctx, phase):
+        if self.global_rank is None:
+            raise RuntimeError(f"async_reduce_scatter {self.id}: global_rank is None")
+        cost = self.bwd_cost if phase == "bwd" else self.fwd_cost
+        if cost == 0 or self.group_size <= 1:
+            return True, None
+        gid = (phase, self.id)
+        if self._posted:
+            return True, None
+        backend_kind, expected = self._backend_kind(ctx)
+        self._eid = ctx.issue_comm_entry(
+            rank=self.global_rank,
+            gid=gid,
+            cost=cost,
+            issue_t=t["comp"],
+            stream=self.stream,
+            mode="sync",
+            backend_kind=backend_kind,
+            expected=expected,
+            log_call_stk=self.call_stk,
+            log_id=self.id,
+            meta=self._issue_meta(),
+        )
+        ctx.event_sink.emit_span(
+            self.call_stk, phase, t["comp"], t["comp"],
+            gid=self.id, stream=self.stream,
+            kind="comm", lane=self.simu_lane,
+            name=self.call_stk.split("-")[-1] + "-post",
+        )
+        ctx.pump_comm_queue()
+        self._posted = True
+        return False, ("yield_keep", gid)
+
+    def _step(self, t, ctx):
+        return True, None
+
+    def _bwd(self, t, ctx):
+        return self._post(t, ctx, "bwd")
+
+    def step(self, t, ctx):
+        return self._step(t, ctx)
+
+    def bwd(self, t, ctx):
+        return self._bwd(t, ctx)
+
+    def prefill_bwd(self):
+        return self
+
+
+class async_wait_collective(LeafModel):
+    """Blocks the comp lane until a posted async collective completes.
+
+    Pairs with ``async_all_gather`` (forward wait) or ``async_reduce_scatter``
+    (backward wait). On entry it checks whether every referenced post op's
+    CommEntry is done: if so it raises ``t["comp"]`` to the latest completion
+    time (the comp stall that realizes any non-overlapped comm) and returns
+    done; otherwise it blocks on ``("comm_entry", eid)`` and the runner re-runs
+    it once that entry completes. The op itself emits no comp-anchored span
+    (LeafModel.step/bwd are bypassed); the comm-lane completion spans and a
+    comp-lane wait span for the stall are emitted here, mirroring the async
+    p2p post/wait trace shape (design doc 4.1/9.3).
+    """
+    simu_kind = "wait"
+
+    def __init__(self, ag_ops, call_stk=''):
+        super().__init__()
+        self.call_stk = call_stk or '-async_wait_collective'
+        # ag_ops: a single async_all_gather/async_reduce_scatter instance, or a
+        # list (dense + MoE sub-ops of one block are waited together).
+        self.ag_ops = list(ag_ops) if isinstance(ag_ops, (list, tuple)) else [ag_ops]
+        self._completed = set()
+
+    def _wait(self, t, ctx, phase):
+        if phase in self._completed:
+            return True, None
+        wait_start = t["comp"]
+        # First pass: every referenced post must be done; find the latest end.
+        end_t = wait_start
+        pending_eid = None
+        for op in self.ag_ops:
+            eid = getattr(op, '_eid', None)
+            if eid is None:
+                # Post was skipped (cost==0 / group_size<=1): nothing to wait.
+                continue
+            if not ctx.entry_done(eid):
+                pending_eid = eid
+                break
+            done_t = ctx.get_entry_end(eid)
+            if done_t is not None and done_t > end_t:
+                end_t = done_t
+        if pending_eid is not None:
+            return False, ("comm_entry", pending_eid)
+        # Emit the comm-lane completion span for each posted op (the AG/RS
+        # activity that ran in parallel with compute), plus a comp-lane wait
+        # span for the stall (zero-duration when fully overlapped).
+        for op in self.ag_ops:
+            eid = getattr(op, '_eid', None)
+            if eid is None:
+                continue
+            entry = ctx.get_entry(eid)
+            if entry is None or entry.launch_t is None or entry.end_t is None:
+                continue
+            ctx.event_sink.emit_span(
+                op.call_stk, phase, entry.launch_t, entry.end_t,
+                gid=op.id, stream=op.stream, kind="comm", lane=op.simu_lane)
+        if end_t > wait_start + 1e-12:
+            ctx.event_sink.emit_span(
+                self.call_stk, phase, wait_start, end_t,
+                kind="wait", lane=None)
+        t["comp"] = max(t["comp"], end_t)
+        self._completed.add(phase)
+        return True, None
+
+    def _step(self, t, ctx):
+        return self._wait(t, ctx, "fwd")
+
+    def _bwd(self, t, ctx):
+        return self._wait(t, ctx, "bwd")
+
+    def step(self, t, ctx):
+        return self._step(t, ctx)
+
+    def bwd(self, t, ctx):
+        return self._bwd(t, ctx)
+
+    def prefill_fwd(self):
+        return self
+
+    def prefill_bwd(self):
+        return self
 
 
 class async_send(LeafModel):

@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, asdict
 from typing import List
-from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, RecomputeStatus, RecomputeBreakModule, all_gather, reduce_scatter
+from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, RecomputeStatus, RecomputeBreakModule, all_gather, reduce_scatter, async_all_gather, async_reduce_scatter, async_wait_collective
 from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.transformer.dense_module import Embedding, Attention, MLAAttention, LayerNorm, LinearCol, MLP, ParallelCE
 from simumax.core.transformer.moe_module import ExpertMLP
@@ -118,6 +118,12 @@ class LLMBlock(MetaModule):
         # prefill_fwd/prefill_bwd stay byte-identical to the MetaModule default.
         self._fsdp_ag_ops = []
         self._fsdp_rs_ops = []
+        # Layer-wise FSDP overlap (docs/design_simu_zero3_fsdp.md section 5.2):
+        # siblings used by the interleaved prefill_fwd/prefill_bwd. _next_block
+        # / _prev_block are linked by LLMModel.prefill so each block can post
+        # the next block's AG (fwd) and wait the next block's RS (bwd).
+        self._next_block = None
+        self._prev_block = None
         self.enable_recompute = enable_recompute
         self.recompute_granularity = (
             "full"
@@ -230,9 +236,12 @@ class LLMBlock(MetaModule):
         )
 
     def _build_fsdp_ag_ops(self, args, com_buff):
-        """Per-LLMBlock FSDP unshard ops: AG(dense params, dp_cp_group) and,
-        for MoE blocks, AG(expert params, edp_group). Built as blocking
-        collectives (fwd_cost only; run before the block's forward)."""
+        """Per-LLMBlock FSDP unshard POST ops: async_all_gather (dense params,
+        dp_cp_group) and, for MoE blocks, async_all_gather (expert params,
+        edp_group). These are POST-only (non-blocking): the previous block's
+        forward posts them so the AG runs on the comm lane during that block's
+        compute, and THIS block's forward waits them. Costs mirror the blocking
+        all_gather. See docs/design_simu_zero3_fsdp.md section 5.2."""
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         model_info = self._model_info
@@ -243,10 +252,11 @@ class LLMBlock(MetaModule):
             net=self.strategy.dp_net, comm_stage="dp_cp",
             strategy=self.strategy, group_kind="dp_cp",
         )
-        ops.append(all_gather(
+        ops.append(async_all_gather(
             f"{state.comm_order}-fsdp_ag-dp_cp_group:{rank_info['dp_cp_group_id']}",
-            rank_info['dp_cp_rank'], dense_group_size, com_buff=com_buff,
-            fwd_cost=dense_ag_cost, bwd_cost=0, global_rank=args.rank,
+            rank_info['dp_cp_rank'], dense_group_size,
+            fwd_cost=dense_ag_cost, global_rank=args.rank,
+            stream="dp_comm",
             net=self.strategy.dp_net, size_bytes=model_info.dense_weight_bytes))
         ops[-1].call_stk = '-fsdp_ag'
         state.comm_order += 1
@@ -257,10 +267,11 @@ class LLMBlock(MetaModule):
                 net=self.strategy.edp_net, comm_stage="edp",
                 strategy=self.strategy, group_kind="edp",
             )
-            ops.append(all_gather(
+            ops.append(async_all_gather(
                 f"{state.comm_order}-fsdp_ag-edp_group:{rank_info['edp_group_id']}",
-                rank_info['edp_rank'], moe_group_size, com_buff=com_buff,
-                fwd_cost=moe_ag_cost, bwd_cost=0, global_rank=args.rank,
+                rank_info['edp_rank'], moe_group_size,
+                fwd_cost=moe_ag_cost, global_rank=args.rank,
+                stream="dp_comm",
                 net=self.strategy.edp_net, size_bytes=model_info.moe_weight_bytes))
             ops[-1].call_stk = '-fsdp_ag'
             state.comm_order += 1
@@ -269,9 +280,12 @@ class LLMBlock(MetaModule):
         return ops
 
     def _build_fsdp_rs_ops(self, args, com_buff):
-        """Per-LLMBlock FSDP reshard ops: RS(dense grads, dp_cp_group) and,
-        for MoE blocks, RS(expert grads, edp_group). Built as blocking
-        collectives (bwd_cost only; run after the block's backward)."""
+        """Per-LLMBlock FSDP reshard POST ops: async_reduce_scatter (dense
+        grads, dp_cp_group) and, for MoE blocks, async_reduce_scatter (expert
+        grads, edp_group). POST-only (non-blocking, bwd-phase): this block's
+        backward posts them after its compute so the RS runs on the comm lane
+        during the NEXT (in bwd order) block's compute, which then waits them.
+        Costs mirror the blocking reduce_scatter."""
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         model_info = self._model_info
@@ -282,10 +296,11 @@ class LLMBlock(MetaModule):
             net=self.strategy.dp_net, comm_stage="dp_cp",
             strategy=self.strategy, group_kind="dp_cp",
         )
-        ops.append(reduce_scatter(
+        ops.append(async_reduce_scatter(
             f"{state.comm_order}-fsdp_rs-dp_cp_group:{rank_info['dp_cp_group_id']}",
-            rank_info['dp_cp_rank'], dense_group_size, com_buff=com_buff,
-            fwd_cost=0, bwd_cost=dense_rs_cost, global_rank=args.rank,
+            rank_info['dp_cp_rank'], dense_group_size,
+            bwd_cost=dense_rs_cost, global_rank=args.rank,
+            stream="dp_comm",
             net=self.strategy.dp_net, size_bytes=model_info.dense_grad_bytes))
         ops[-1].call_stk = '-fsdp_rs'
         state.comm_order += 1
@@ -296,10 +311,11 @@ class LLMBlock(MetaModule):
                 net=self.strategy.edp_net, comm_stage="edp",
                 strategy=self.strategy, group_kind="edp",
             )
-            ops.append(reduce_scatter(
+            ops.append(async_reduce_scatter(
                 f"{state.comm_order}-fsdp_rs-edp_group:{rank_info['edp_group_id']}",
-                rank_info['edp_rank'], moe_group_size, com_buff=com_buff,
-                fwd_cost=0, bwd_cost=moe_rs_cost, global_rank=args.rank,
+                rank_info['edp_rank'], moe_group_size,
+                bwd_cost=moe_rs_cost, global_rank=args.rank,
+                stream="dp_comm",
                 net=self.strategy.edp_net, size_bytes=model_info.moe_grad_bytes))
             ops[-1].call_stk = '-fsdp_rs'
             state.comm_order += 1
@@ -309,17 +325,56 @@ class LLMBlock(MetaModule):
 
     def prefill_fwd(self):
         fwd = super().prefill_fwd()
-        if self._fsdp_ag_ops:
-            # FwdQue is FIFO (pops front); prepend the AG ops so they run
-            # before the block's children forward.
+        if self._is_layer_wise_fsdp and self._fsdp_ag_ops:
+            # Interleaved layer-wise FSDP forward (design doc 5.2). Per block
+            # the FwdQue (FIFO) becomes:
+            #   [post AG(0)] -> [wait AG(this)] -> [post AG(next)] -> [compute]
+            # so the next block's AG runs on the comm lane DURING this block's
+            # compute on the comp lane. The first block prepends its own
+            # [post AG(0)] (no previous block to overlap with -> fully
+            # exposed); the last block has no next, so no trailing post.
+            ag_this = self._fsdp_ag_ops
+            ag_next = self._next_block._fsdp_ag_ops if self._next_block else []
+            head = [async_wait_collective(ag_this, call_stk=self.call_stk + '-fsdp_ag_wait')]
+            if self._prev_block is None:
+                # First block: its own AG is posted then immediately waited
+                # (fully exposed, no overlap window available).
+                head = [op.prefill_fwd() for op in ag_this] + head
+            head += [op.prefill_fwd() for op in ag_next]
+            fwd.que[0:0] = head
+        elif self._fsdp_ag_ops:
+            # Non-layer-wise path (kept for completeness): inject blocking AG
+            # ops before the block's children forward, byte-identical to today.
             fwd.que[0:0] = [op.prefill_fwd() for op in self._fsdp_ag_ops]
         return fwd
 
     def prefill_bwd(self):
         bwd = super().prefill_bwd()
-        if self._fsdp_rs_ops:
-            # BwdStk is LIFO (pops end); prepend the RS ops so they are popped
-            # last, i.e. run after the block's children backward.
+        if self._is_layer_wise_fsdp and self._fsdp_rs_ops:
+            # Interleaved layer-wise FSDP backward (design doc 5.2). BwdStk is
+            # LIFO (pops end), so prepending [post RS(this), wait RS(next)] to
+            # the front makes the children backward pop FIRST (temporal order
+            # = compute bwd -> wait RS(next) -> post RS(this)):
+            #   - compute bwd(this): runs on the comp lane, overlapping the
+            #     RS posted by the previous (in bwd order) block on the comm
+            #     lane;
+            #   - wait RS(next): re-sync to that RS completion (stall only if
+            #     the RS outlives this block's compute -> the exposed tail);
+            #   - post RS(this): launch this block's reshard to overlap the
+            #     next (in bwd order) block's compute.
+            # The first bwd block (last fwd block, _next_block is None) has no
+            # RS to wait; the last bwd block (first fwd block, _prev_block is
+            # None) has no next bwd block, so its trailing post RS is exposed.
+            rs_this = self._fsdp_rs_ops
+            rs_next = self._next_block._fsdp_rs_ops if self._next_block else []
+            tail = [op.prefill_bwd() for op in rs_this]
+            if self._next_block is not None:
+                tail.append(async_wait_collective(rs_next, call_stk=self.call_stk + '-fsdp_rs_wait'))
+            bwd.stk[0:0] = tail
+        elif self._fsdp_rs_ops:
+            # Non-layer-wise path (kept for completeness): inject blocking RS
+            # ops popped last (after the block's children backward), identical
+            # to today.
             bwd.stk[0:0] = [op.prefill_bwd() for op in self._fsdp_rs_ops]
         return bwd
 
@@ -722,3 +777,10 @@ class LLMModel(MetaModule):
         for layer in self.children_ordered_module:
             self.layers.append(layer)
             layer.prefill(args, self.call_stk, com_buff=com_buff)
+        # Link consecutive LLMBlocks so each can reach its neighbor's layer-wise
+        # FSDP AG/RS post ops during prefill_fwd/prefill_bwd interleaving. Only
+        # LLMBlocks carry FSDP ops; embedding/final-norm leaves are skipped.
+        blocks = [m for m in self.layers if isinstance(m, LLMBlock)]
+        for i, blk in enumerate(blocks):
+            blk._prev_block = blocks[i - 1] if i > 0 else None
+            blk._next_block = blocks[i + 1] if i + 1 < len(blocks) else None
