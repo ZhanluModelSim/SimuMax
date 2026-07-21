@@ -5,7 +5,8 @@
 
 # Design Proposal: Hierarchical Network Topology
 
-- Status: **Draft v0.1** (design agreed in discussion, not yet implemented)
+- Status: **v1.0 (Phases 1-3 implemented)**
+- Implementation: phase 1 `6b9dd4d`, phase 2 `a32519a`, phase 3 `206f879`.
 - Date: 2026-07-17
 - Scope: network topology declaration, comm-domain→level mapping,
   per-level cost composition, fabric level servers, placement config.
