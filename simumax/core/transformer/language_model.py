@@ -248,6 +248,7 @@ class LLMBlock(MetaModule):
             rank_info['dp_cp_rank'], dense_group_size, com_buff=com_buff,
             fwd_cost=dense_ag_cost, bwd_cost=0, global_rank=args.rank,
             net=self.strategy.dp_net, size_bytes=model_info.dense_weight_bytes))
+        ops[-1].call_stk = '-fsdp_ag'
         state.comm_order += 1
         if model_info.moe_weight_bytes > 0:
             moe_group_size = self.strategy.edp_size
@@ -261,6 +262,7 @@ class LLMBlock(MetaModule):
                 rank_info['edp_rank'], moe_group_size, com_buff=com_buff,
                 fwd_cost=moe_ag_cost, bwd_cost=0, global_rank=args.rank,
                 net=self.strategy.edp_net, size_bytes=model_info.moe_weight_bytes))
+            ops[-1].call_stk = '-fsdp_ag'
             state.comm_order += 1
         for op in ops:
             op.prefill(args, call_stk=self.call_stk, com_buff=com_buff)
@@ -285,6 +287,7 @@ class LLMBlock(MetaModule):
             rank_info['dp_cp_rank'], dense_group_size, com_buff=com_buff,
             fwd_cost=0, bwd_cost=dense_rs_cost, global_rank=args.rank,
             net=self.strategy.dp_net, size_bytes=model_info.dense_grad_bytes))
+        ops[-1].call_stk = '-fsdp_rs'
         state.comm_order += 1
         if model_info.moe_grad_bytes > 0:
             moe_group_size = self.strategy.edp_size
@@ -298,6 +301,7 @@ class LLMBlock(MetaModule):
                 rank_info['edp_rank'], moe_group_size, com_buff=com_buff,
                 fwd_cost=0, bwd_cost=moe_rs_cost, global_rank=args.rank,
                 net=self.strategy.edp_net, size_bytes=model_info.moe_grad_bytes))
+            ops[-1].call_stk = '-fsdp_rs'
             state.comm_order += 1
         for op in ops:
             op.prefill(args, call_stk=self.call_stk, com_buff=com_buff)
