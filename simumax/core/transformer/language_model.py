@@ -3,11 +3,11 @@
 from copy import deepcopy
 from dataclasses import dataclass, asdict
 from typing import List
-from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, RecomputeStatus, RecomputeBreakModule
+from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, RecomputeStatus, RecomputeBreakModule, all_gather, reduce_scatter
 from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.transformer.dense_module import Embedding, Attention, MLAAttention, LayerNorm, LinearCol, MLP, ParallelCE
 from simumax.core.transformer.moe_module import ExpertMLP
-from simumax.core.utils import format_scope_microbatch_tag
+from simumax.core.utils import format_scope_microbatch_tag, get_rank_group
 
 @dataclass
 class PeakPoint:
@@ -113,6 +113,11 @@ class LLMBlock(MetaModule):
         super().__init__(strategy, system, specific_name)
         self.config = deepcopy(config)
         self.layer_idx = layer_idx
+        # Layer-wise FSDP per-LLMBlock AG/RS Com ops (built in prefill() when
+        # zero_state >= 3 and fsdp_mode == "layer-wise"); empty otherwise so
+        # prefill_fwd/prefill_bwd stay byte-identical to the MetaModule default.
+        self._fsdp_ag_ops = []
+        self._fsdp_rs_ops = []
         self.enable_recompute = enable_recompute
         self.recompute_granularity = (
             "full"
@@ -205,6 +210,114 @@ class LLMBlock(MetaModule):
         for layer in self.children_ordered_module:
             self.layers.append(layer)
             layer.prefill(args, self.call_stk, com_buff=com_buff)
+        # Layer-wise FSDP (zero_state >= 3 + fsdp_mode == "layer-wise"):
+        # inject per-LLMBlock all-gather (unshard params) before the block's
+        # forward and reduce-scatter (reshard grads) after the block's backward
+        # as blocking collectives. The ops are built here (where args/thread
+        # state/rank_info are available) and injected by the prefill_fwd /
+        # prefill_bwd overrides. _model_info is populated by run_estimate's
+        # fake-forward (_comp_model_info), which runs before simulate() calls
+        # prefill(). See docs/design_simu_zero3_fsdp.md section 5.2.
+        if self._is_layer_wise_fsdp:
+            self._fsdp_ag_ops = self._build_fsdp_ag_ops(args, com_buff)
+            self._fsdp_rs_ops = self._build_fsdp_rs_ops(args, com_buff)
+
+    @property
+    def _is_layer_wise_fsdp(self):
+        return (
+            getattr(self.strategy, "fsdp_mode", "model-wise") == "layer-wise"
+            and self.strategy.zero_state >= 3
+        )
+
+    def _build_fsdp_ag_ops(self, args, com_buff):
+        """Per-LLMBlock FSDP unshard ops: AG(dense params, dp_cp_group) and,
+        for MoE blocks, AG(expert params, edp_group). Built as blocking
+        collectives (fwd_cost only; run before the block's forward)."""
+        state = args.thread_state
+        rank_info = get_rank_group(args.rank, self.strategy)
+        model_info = self._model_info
+        ops = []
+        dense_group_size = self.strategy.dp_size * self.strategy.cp_size
+        dense_ag_cost = self.system.compute_net_op_time(
+            "all_gather", model_info.dense_weight_bytes, dense_group_size,
+            net=self.strategy.dp_net, comm_stage="dp_cp",
+            strategy=self.strategy, group_kind="dp_cp",
+        )
+        ops.append(all_gather(
+            f"{state.comm_order}-fsdp_ag-dp_cp_group:{rank_info['dp_cp_group_id']}",
+            rank_info['dp_cp_rank'], dense_group_size, com_buff=com_buff,
+            fwd_cost=dense_ag_cost, bwd_cost=0, global_rank=args.rank,
+            net=self.strategy.dp_net, size_bytes=model_info.dense_weight_bytes))
+        state.comm_order += 1
+        if model_info.moe_weight_bytes > 0:
+            moe_group_size = self.strategy.edp_size
+            moe_ag_cost = self.system.compute_net_op_time(
+                "all_gather", model_info.moe_weight_bytes, moe_group_size,
+                net=self.strategy.edp_net, comm_stage="edp",
+                strategy=self.strategy, group_kind="edp",
+            )
+            ops.append(all_gather(
+                f"{state.comm_order}-fsdp_ag-edp_group:{rank_info['edp_group_id']}",
+                rank_info['edp_rank'], moe_group_size, com_buff=com_buff,
+                fwd_cost=moe_ag_cost, bwd_cost=0, global_rank=args.rank,
+                net=self.strategy.edp_net, size_bytes=model_info.moe_weight_bytes))
+            state.comm_order += 1
+        for op in ops:
+            op.prefill(args, call_stk=self.call_stk, com_buff=com_buff)
+        return ops
+
+    def _build_fsdp_rs_ops(self, args, com_buff):
+        """Per-LLMBlock FSDP reshard ops: RS(dense grads, dp_cp_group) and,
+        for MoE blocks, RS(expert grads, edp_group). Built as blocking
+        collectives (bwd_cost only; run after the block's backward)."""
+        state = args.thread_state
+        rank_info = get_rank_group(args.rank, self.strategy)
+        model_info = self._model_info
+        ops = []
+        dense_group_size = self.strategy.dp_size * self.strategy.cp_size
+        dense_rs_cost = self.system.compute_net_op_time(
+            "reduce_scatter", model_info.dense_grad_bytes, dense_group_size,
+            net=self.strategy.dp_net, comm_stage="dp_cp",
+            strategy=self.strategy, group_kind="dp_cp",
+        )
+        ops.append(reduce_scatter(
+            f"{state.comm_order}-fsdp_rs-dp_cp_group:{rank_info['dp_cp_group_id']}",
+            rank_info['dp_cp_rank'], dense_group_size, com_buff=com_buff,
+            fwd_cost=0, bwd_cost=dense_rs_cost, global_rank=args.rank,
+            net=self.strategy.dp_net, size_bytes=model_info.dense_grad_bytes))
+        state.comm_order += 1
+        if model_info.moe_grad_bytes > 0:
+            moe_group_size = self.strategy.edp_size
+            moe_rs_cost = self.system.compute_net_op_time(
+                "reduce_scatter", model_info.moe_grad_bytes, moe_group_size,
+                net=self.strategy.edp_net, comm_stage="edp",
+                strategy=self.strategy, group_kind="edp",
+            )
+            ops.append(reduce_scatter(
+                f"{state.comm_order}-fsdp_rs-edp_group:{rank_info['edp_group_id']}",
+                rank_info['edp_rank'], moe_group_size, com_buff=com_buff,
+                fwd_cost=0, bwd_cost=moe_rs_cost, global_rank=args.rank,
+                net=self.strategy.edp_net, size_bytes=model_info.moe_grad_bytes))
+            state.comm_order += 1
+        for op in ops:
+            op.prefill(args, call_stk=self.call_stk, com_buff=com_buff)
+        return ops
+
+    def prefill_fwd(self):
+        fwd = super().prefill_fwd()
+        if self._fsdp_ag_ops:
+            # FwdQue is FIFO (pops front); prepend the AG ops so they run
+            # before the block's children forward.
+            fwd.que[0:0] = [op.prefill_fwd() for op in self._fsdp_ag_ops]
+        return fwd
+
+    def prefill_bwd(self):
+        bwd = super().prefill_bwd()
+        if self._fsdp_rs_ops:
+            # BwdStk is LIFO (pops end); prepend the RS ops so they are popped
+            # last, i.e. run after the block's children backward.
+            bwd.stk[0:0] = [op.prefill_bwd() for op in self._fsdp_rs_ops]
+        return bwd
 
 
 class LLMModel(MetaModule):

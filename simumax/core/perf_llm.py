@@ -1663,7 +1663,125 @@ class PerfLLM(PerfBase):
             'dense': dense_dp_result,
             'moe': moe_dp_result,
         }
+        # Layer-wise FSDP overlap estimate (design doc 5.1): per-LLMBlock AG/RS
+        # is overlapped with adjacent-block fwd/bwd compute, so only the
+        # non-overlappable fraction is exposed. Active only when
+        # ``zero_state >= 3`` and ``fsdp_mode == "layer-wise"``; otherwise the
+        # exposed time stays equal to the full comm time (no overlap), which
+        # is byte-identical to the legacy path.
+        fsdp_layer_wise = (
+            self.strategy.zero_state >= 3
+            and getattr(self.strategy, 'fsdp_mode', 'model-wise') == 'layer-wise'
+        )
+        if fsdp_layer_wise:
+            all_result['dp_comm_exposed_time'] = (
+                self._compute_layer_wise_fsdp_exposed_time(model_name))
         return all_result
+
+    def _compute_layer_wise_fsdp_exposed_time(self, model_name):
+        """Analytical overlap estimate for layer-wise FSDP (design doc 5.1).
+
+        For each ``LLMBlock`` in the model chunk, the per-block all-gather
+        (param unshard, fwd) and reduce-scatter (grad reshard, bwd) costs are
+        overlapped with the *previous* block's fwd compute and the *next*
+        block's bwd compute respectively. The first block's AG has no previous
+        block to overlap with -> fully exposed; the last block's RS has no
+        next block -> fully exposed. The result is a conservative upper bound
+        on the non-overlappable comm fraction; the DES ``simulate()`` path
+        gives the precise value via post/wait scheduling.
+
+        Dense params/grads use the ``dp_cp`` group; MoE expert params/grads use
+        the ``edp`` group and are added to the same per-block comm cost. Per-
+        block compute times come from the existing chunk-level
+        ``_compute_single_batch_phase_inputs`` (fwd/bwd compute) divided by the
+        number of blocks.
+        """
+        chunk = self.model_chunk_dict[model_name]
+        layer_num = getattr(chunk, 'layer_num', 0)
+        if layer_num <= 0:
+            return 0.0
+
+        dp_group_size = self.strategy.dp_size * self.strategy.cp_size
+        edp_group_size = self.strategy.edp_size
+
+        # Per-block sharded weight/grad bytes. When the chunk is a live
+        # ``LLMModel`` (the default, profile cache off) we read each block's
+        # model_info directly so dense-vs-MoE blocks keep their distinct
+        # param/grad bytes. When the chunk is a ``CachedChunkProfile`` (profile
+        # cache on) per-block access is unavailable, so we fall back to an even
+        # per-layer division of the chunk-level bytes -- exact for dense models
+        # and a close approximation for MoE.
+        block_infos = []  # (dense_weight, dense_grad, moe_weight, moe_grad)
+        if hasattr(chunk, 'layer_0'):
+            for i in range(layer_num):
+                block = getattr(chunk, f'layer_{i}', None)
+                if block is None:
+                    continue
+                mi = block.get_model_info()
+                block_infos.append((
+                    mi.dense_weight_bytes, mi.dense_grad_bytes,
+                    mi.moe_weight_bytes, mi.moe_grad_bytes,
+                ))
+        else:
+            mi = chunk.get_model_info()
+            for _ in range(layer_num):
+                block_infos.append((
+                    mi.dense_weight_bytes / layer_num,
+                    mi.dense_grad_bytes / layer_num,
+                    mi.moe_weight_bytes / layer_num,
+                    mi.moe_grad_bytes / layer_num,
+                ))
+        n = len(block_infos)
+        if n == 0:
+            return 0.0
+
+        # Per-block fwd/bwd compute time = chunk compute / num_blocks. The
+        # overlap window is the block's own execution (compute + intra-net,
+        # recompute folded into bwd); p2p (inter-stage) is excluded since AG/RS
+        # overlap happens within a stage.
+        phase = self._compute_single_batch_phase_inputs(model_name)
+        fwd_per_block = phase["fwd_compute"] / n
+        bwd_per_block = phase["bwd_compute"] / n
+
+        ag_list = []
+        rs_list = []
+        for dense_w, dense_g, moe_w, moe_g in block_infos:
+            ag = 0.0
+            rs = 0.0
+            if dense_w > 0 and dp_group_size > 1:
+                ag += self.system.compute_net_op_time(
+                    "all_gather", dense_w, comm_num=dp_group_size,
+                    net=self.strategy.dp_net, comm_stage="dp_cp",
+                    strategy=self.strategy, group_kind="dp_cp")
+            if dense_g > 0 and dp_group_size > 1:
+                rs += self.system.compute_net_op_time(
+                    "reduce_scatter", dense_g, comm_num=dp_group_size,
+                    net=self.strategy.dp_net, comm_stage="dp_cp",
+                    strategy=self.strategy, group_kind="dp_cp")
+            if moe_w > 0 and edp_group_size > 1:
+                ag += self.system.compute_net_op_time(
+                    "all_gather", moe_w, comm_num=edp_group_size,
+                    net=self.strategy.edp_net, comm_stage="edp",
+                    strategy=self.strategy, group_kind="edp")
+            if moe_g > 0 and edp_group_size > 1:
+                rs += self.system.compute_net_op_time(
+                    "reduce_scatter", moe_g, comm_num=edp_group_size,
+                    net=self.strategy.edp_net, comm_stage="edp",
+                    strategy=self.strategy, group_kind="edp")
+            ag_list.append(ag)
+            rs_list.append(rs)
+
+        # Forward: AG for block i overlaps with compute of block i-1. Block 0
+        # has no predecessor -> its AG is fully exposed.
+        fwd_exposed = ag_list[0]
+        for i in range(1, n):
+            fwd_exposed += max(0.0, ag_list[i] - fwd_per_block)
+        # Backward: RS for block i overlaps with compute of block i+1. The last
+        # block has no successor -> its RS is fully exposed.
+        bwd_exposed = rs_list[n - 1]
+        for i in range(n - 1):
+            bwd_exposed += max(0.0, rs_list[i] - bwd_per_block)
+        return fwd_exposed + bwd_exposed
 
     def _analysis_mem_impl(
         self,

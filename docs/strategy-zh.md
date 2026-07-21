@@ -187,11 +187,21 @@ FSDP 通信模式，仅在 `zero_state >= 3` 时有意义；默认 `"model-wise"
   并不节省峰值显存——all-gather 缓冲区持有完整的未分片参数，因此峰值近似为
   `完整参数 + 分片梯度 + 分片状态 + 激活`（与 `zero_state = 1` 相同）；其收益
   仅为 ZeRO-1 已捕获的优化器状态分片。
-- `"layer-wise"`（Phase 2，尚未实现）：按 `LLMBlock` 进行 all-gather /
-  reduce-scatter，并通过 post/wait 与相邻层重叠；峰值显存更低（同一时刻只
-  gathering 一个 block 的参数），当通信超出重叠窗口时会暴露通信时间。
+- `"layer-wise"`（Phase 2）：按 `LLMBlock` 在该 block 前向之前 all-gather
+  参数、在该 block 反向之后 reduce-scatter 梯度。稠密参数/梯度走 `dp_cp` 组
+  （`dp_size * cp_size`，`dp_net`）；当 block 含专家时，MoE 专家参数/梯度走
+  `edp` 组（`edp_size`，`edp_net`）。在 DES（`simulate()`）路径中，这些通信以
+  **阻塞式**集合通信注入（暂无异步重叠），因此 trace 中呈现的是按 block 顺序
+  排布、与各 block 计算串行的非重叠 AG/RS 区间。快速解析路径（`analysis()`）
+  给出重叠估计 `dp_comm_exposed_time = Σ_blocks max(0, comm_block -
+  prev_compute_block)`（前向 + 反向）；DES 给出精确的非重叠值，异步 post/wait
+  重叠为后续工作。峰值显存为 `静态（分片）+ 一个 block 的未分片参数 + 激活`——
+  远低于 model-wise，因为同一时刻只 gathering 一个 block 的参数而非整模型。当
+  `zero_state <= 1` 或 `fsdp_mode != "layer-wise"` 时，`LLMBlock` 的前向/反向
+  保持不变。
 
-详见 `docs/design_simu_zero3_fsdp.md` 第 4 节。
+详见 `docs/design_simu_zero3_fsdp.md` 第 4 节（model-wise）与第 5 节
+（layer-wise）。
 ## 内存优化
 ### grad_reduce_in_bf16
 梯度归约是否使用bf16，默认为false

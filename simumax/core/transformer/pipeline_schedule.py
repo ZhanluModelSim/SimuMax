@@ -99,6 +99,25 @@ class OptimizerSimulator(MetaModule):
                 layer.prefill(args, self.call_stk, com_buff=com_buff)
             return
 
+        # Layer-wise FSDP (zero_state >= 3 and fsdp_mode == "layer-wise"):
+        # the per-block all-gather (fwd) and reduce-scatter (bwd) happen inside
+        # each LLMBlock's prefill_fwd/prefill_bwd (injected in language_model.py
+        # as blocking collectives), so the OptimizerSimulator tail collapses to
+        # just the optimizer step -- no RS, no AG, no world barrier. See
+        # docs/design_simu_zero3_fsdp.md section 5.2.
+        fsdp_layer_wise = (
+            self.strategy.zero_state >= 3
+            and getattr(self.strategy, 'fsdp_mode', 'model-wise') == 'layer-wise'
+        )
+        if fsdp_layer_wise:
+            optim_step = AtomModel(
+                fwd_cost=opt_info['optim_time'], bwd_cost=0,
+                specific_name='optimizer_step')
+            self._step_only_layers = [optim_step]
+            for layer in self._step_only_layers:
+                layer.prefill(args, self.call_stk, com_buff=com_buff)
+            return
+
         if self.strategy.zero_state >= 1:
             # optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size, set comm_num accordingly
             cost_dense, cost_moe = comm_info['dense'], comm_info['moe']
@@ -169,6 +188,22 @@ class OptimizerSimulator(MetaModule):
         """
         fwd = FwdQue(call_stk=self.call_stk)
         for layer in self._reshard_step_layers:
+            fwd.append(layer.prefill_fwd())
+        return fwd
+
+    def prefill_step_only_fwd(self):
+        """Layer-wise FSDP tail: optimizer step only.
+
+        Returns a ``FwdQue`` wrapping just ``[AtomModel(optim_step)]``. The
+        per-block all-gather (fwd) and reduce-scatter (bwd) are injected into
+        each ``LLMBlock`` by ``language_model.py`` (blocking collectives), so
+        the OptimizerSimulator carries no RS/AG/world-barrier ops -- only the
+        optimizer update. Built only when ``zero_state >= 3`` and
+        ``fsdp_mode == "layer-wise"``; intended to be appended after the PP
+        backward. See ``docs/design_simu_zero3_fsdp.md`` section 5.2.
+        """
+        fwd = FwdQue(call_stk=self.call_stk)
+        for layer in self._step_only_layers:
             fwd.append(layer.prefill_fwd())
         return fwd
 

@@ -135,17 +135,23 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
 
         op_block = OptimizerSimulator(perf_model, model_name)
         op_block.prefill(args, com_buff=None)
-        # Model-wise FSDP (zero_state >= 3): unshard (all-gather params) runs
-        # before the PP forward (prepended), reshard (reduce-scatter grads) +
-        # optim_step runs after the PP backward (appended). Otherwise the
-        # legacy ZeRO-1 tail (RS -> barrier -> optim -> AG) is appended as a
-        # single block. See docs/design_simu_zero3_fsdp.md section 4.2.
-        if getattr(perf_model.strategy, 'fsdp_mode', 'model-wise') == 'model-wise' \
+        # FSDP tail wiring (docs/design_simu_zero3_fsdp.md sections 4.2/5.2):
+        # - layer-wise: per-block AG/RS live inside LLMBlock prefill_fwd/bwd, so
+        #   the OptimizerSimulator tail is just the optimizer step (appended).
+        # - model-wise: unshard (all-gather params) is prepended before the PP
+        #   forward; reshard (reduce-scatter grads) + optim_step is appended
+        #   after the PP backward.
+        # - otherwise (zero_state <= 1): the legacy ZeRO-1 tail (RS -> barrier ->
+        #   optim -> AG) is appended as a single block.
+        if getattr(perf_model.strategy, 'fsdp_mode', 'model-wise') == 'layer-wise' \
                 and perf_model.strategy.zero_state >= 3:
-            thread.job.insert(0, op_block.prefill_unshard_fwd())
+            thread.job.append(op_block.prefill_step_only_fwd())  # optim_step only, no AG/RS
+        elif getattr(perf_model.strategy, 'fsdp_mode', 'model-wise') == 'model-wise' \
+                and perf_model.strategy.zero_state >= 3:
+            thread.job.insert(0, op_block.prefill_unshard_fwd())  # Phase 1
             thread.job.append(op_block.prefill_reshard_step_fwd())
         else:
-            thread.job.append(op_block.prefill_fwd())
+            thread.job.append(op_block.prefill_fwd())  # legacy
 
         simu.threads.append(thread)
 

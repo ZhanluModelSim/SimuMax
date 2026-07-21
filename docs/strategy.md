@@ -198,12 +198,24 @@ FSDP communication pattern, only meaningful when `zero_state >= 3`; default
   approximately `full params + sharded grads + sharded states + activations`
   (same as `zero_state = 1`); its savings are the optimizer-state sharding
   already captured by ZeRO-1.
-- `"layer-wise"` (Phase 2, not yet implemented): per-`LLMBlock` all-gather /
-  reduce-scatter with adjacent-layer overlap via post/wait; lower peak memory
-  (one block's params gathered at a time) and exposed comm time when comm
-  exceeds the overlap window.
+- `"layer-wise"` (Phase 2): per-`LLMBlock` all-gather of params before the
+  block's forward and reduce-scatter of grads after the block's backward.
+  Dense params/grads move on the `dp_cp` group (`dp_size * cp_size`,
+  `dp_net`); MoE expert params/grads move on the `edp` group (`edp_size`,
+  `edp_net`) when the block has experts. In the DES (`simulate()`) path these
+  are injected as **blocking** collectives (no async overlap yet), so the
+  trace shows non-overlapped per-block AG/RS spans sequenced around each
+  block's compute. The fast analytical path (`analysis()`) computes an
+  overlap estimate `dp_comm_exposed_time = Σ_blocks max(0, comm_block -
+  prev_compute_block)` (forward + backward); the DES gives the precise
+  non-overlapped value, and async post/wait overlap is future work. Peak
+  memory is `static (sharded) + one block's unsharded params + activations` —
+  much lower than model-wise, since only one block's params are gathered at
+  a time instead of the whole model's. For `zero_state <= 1` or
+  `fsdp_mode != "layer-wise"`, `LLMBlock` forward/backward are unchanged.
 
-See `docs/design_simu_zero3_fsdp.md` section 4.
+See `docs/design_simu_zero3_fsdp.md` sections 4 (model-wise) and 5
+(layer-wise).
 
 ## Memory Optimization
 ### grad_reduce_in_bf16
