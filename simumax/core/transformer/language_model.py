@@ -7,6 +7,7 @@ from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugConte
 from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.transformer.dense_module import Embedding, Attention, MLAAttention, LayerNorm, LinearCol, MLP, ParallelCE
 from simumax.core.transformer.moe_module import ExpertMLP
+from simumax.core.transformer.vwn_module import VWNInModule, VWNOutModule
 from simumax.core.utils import format_scope_microbatch_tag, get_rank_group
 
 @dataclass
@@ -200,7 +201,33 @@ class LLMBlock(MetaModule):
                     system=system,
                     specific_name='MoELayer'
                 )
+        # ───  VWN (Variable Window Network) integration ───
+        vwn_indices = getattr(config, 'vwn_layer_indices', None) or []
+        self.use_vwn = layer_idx in vwn_indices
+        if self.use_vwn:
+            vwn_n = getattr(config, 'vwn_n', 1) or 1
+            vwn_m = getattr(config, 'vwn_m', 1) or 1
+            self.vwn_in = VWNInModule(
+                    hidden_size=self.config.hidden_size,
+                    vwn_n=vwn_n,
+                    vwn_m=vwn_m,
+                    strategy=strategy,
+                    system=system,
+                )
+            self.vwn_out = VWNOutModule(
+                    hidden_size=self.config.hidden_size,
+                    vwn_n=vwn_n,
+                    vwn_m=vwn_m,
+                    strategy=strategy,
+                    system=system,
+                )
+        else:
+            self.vwn_in = None
+            self.vwn_out = None
+
     def forward(self, input_info:InputOutputInfo, path_debug_context:PathDebugContext):
+        # NOTE: VWN forward integration not yet implemented —
+        # uses standard Pre-LN path. VWN modules are created but not wired in.
         hidden_state = self.layernorm_input(input_info, path_debug_context)
         hidden_state = self.attention(hidden_state, path_debug_context)
         hidden_state = self.pre_mlp_layernorm(hidden_state, path_debug_context)

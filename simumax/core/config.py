@@ -1813,6 +1813,15 @@ class ModelConfig(Config):
     expert_num: int = 1
     topk: int = None
     attention_type: str = 'mha'
+    # ───  SWA (Sliding Window Attention) config  ───
+    swa_head_num: int = 0               # SWA query head count (0 = no SWA)
+    swa_kv_head_num: int = None         # SWA KV head count (None = same as swa_head_num)
+    swa_head_dim: int = None            # SWA head dim (None = use head_size)
+    swa_window_size: int = 1028         # sliding window size (from op_define)
+    # ───  VWN (Variable Window Network) config  ───
+    vwn_n: int = 1                      # residual streams count
+    vwn_m: int = 1                      # block output streams count
+    vwn_layer_indices: list = None      # layer indices using VWN (None = none)
     moe_ffn_hidden_size: int = None
     moe_shared_expert_intermediate_size: int = None
     v_head_dim: int = None
@@ -1840,6 +1849,12 @@ class ModelConfig(Config):
                 self.model_type = 'moe'
             else:
                 self.model_type = 'dense'
+        # SWA defaults: convenient shorthand for full-SWA models
+        if self.swa_head_num > 0:
+            if self.swa_kv_head_num is None:
+                self.swa_kv_head_num = self.swa_head_num
+            if self.swa_head_dim is None:
+                self.swa_head_dim = self.head_size
 
     @classmethod
     def init_from_config_file(cls, config_file: str):

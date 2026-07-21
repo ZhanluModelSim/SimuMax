@@ -13,6 +13,7 @@ from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, Atten
 from simumax.core.utils import format_model_info_microbatch_tag, get_rank_group
 import simumax.core.transformer.simu_ops as simu_ops
 from simumax.core.transformer.function import ConcatFunction,SplitFunction
+from simumax.core.transformer.swa_module import SWACoreAttention
 
 #region ------------------ Atomic module ------------------
 class Embedding(MetaModule):
@@ -2591,19 +2592,38 @@ class Attention(MetaModule):
                 strategy=strategy,
                 system=system
             )
-        
-        self.attention = CoreAttention(
-                head_size=config.head_size,
-                head_num=config.head_num,
-                kv_head_num=config.kv_head_num,
-                use_math_sdp=self.strategy.use_math_sdp,
-                use_flash_sdp=self.strategy.use_flash_sdp,
-                has_cached_inputs=False,
-                enable_recompute=attention_recompute_conf.core_attn_recompute,
-                strategy=strategy,
-                system=system,
-                is_last_recompute = True
-            )
+
+        if config.swa_head_num > 0:
+            # head_dim / kv_head_num may be None if set after __post_init__;
+            # resolve here: None -> same-as-SWA-head defaults
+            swa_hc = config.swa_head_dim or config.head_size
+            swa_kvh = config.swa_kv_head_num or config.swa_head_num
+            self.attention = SWACoreAttention(
+                    head_size=swa_hc,
+                    head_num=config.swa_head_num,
+                    kv_head_num=swa_kvh,
+                    window_size=config.swa_window_size,
+                    use_math_sdp=self.strategy.use_math_sdp,
+                    use_flash_sdp=self.strategy.use_flash_sdp,
+                    has_cached_inputs=False,
+                    enable_recompute=attention_recompute_conf.core_attn_recompute,
+                    strategy=strategy,
+                    system=system,
+                    is_last_recompute=True,
+                )
+        else:
+            self.attention = CoreAttention(
+                    head_size=config.head_size,
+                    head_num=config.head_num,
+                    kv_head_num=config.kv_head_num,
+                    use_math_sdp=self.strategy.use_math_sdp,
+                    use_flash_sdp=self.strategy.use_flash_sdp,
+                    has_cached_inputs=False,
+                    enable_recompute=attention_recompute_conf.core_attn_recompute,
+                    strategy=strategy,
+                    system=system,
+                    is_last_recompute = True
+                )
         linear_out_input_size = self.config.head_num * self.config.head_size
         self.linear_out = LinearRow_(
                 layer_idx=layer_idx,
