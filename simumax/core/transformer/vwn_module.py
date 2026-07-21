@@ -114,75 +114,70 @@ class VWNInModule(MetaModule):
     # ───  Method 2: memory access  ───
     def _comp_leaf_mem_accessed_info(self):
         T = self._token_count
-        element_size = self.dtype_to_element_size[self.strategy.dtype]
+        bf16_sz = self.element_size              # 2: x, norm_w, gate_w, gate_b,
+        fp32_sz = self.dtype_to_element_size["fp32"]  # 4: residual only
 
-        # Reads (from op_define L120-153 input/weight descriptions):
+        # Reads (all bf16):
         #   - x[T, VWN_N, V] bf16
         #   - norm_weight[V] bf16
         #   - gating_weight[V, G] bf16
         #   - gating_bias[G] bf16
-        read_activation = T * self.vwn_n * self.V
-        read_norm_weight = self.V
-        read_gating_weight = self.V * self.G
-        read_gating_bias = self.G
-        total_read = read_activation + read_norm_weight + read_gating_weight + read_gating_bias
+        read_act = T * self.vwn_n * self.V * bf16_sz
+        read_w   = self.V * bf16_sz
+        read_gw  = self.V * self.G * bf16_sz
+        read_gb  = self.G * bf16_sz
+        read_total = read_act + read_w + read_gw + read_gb
 
         # Writes:
         #   - block_input[T, VWN_M, V] bf16
-        #   - residual[T, VWN_N, V] bf16
-        #   - b_gate[T, VWN_N, VWN_M] bf16
-        write_block = T * self.vwn_m * self.V
-        write_residual = T * self.vwn_n * self.V
-        write_b_gate = T * self.vwn_n * self.vwn_m
-        total_write = write_block + write_residual + write_b_gate
+        #   - residual[T, VWN_N, V]     fp32  ← 残差用 fp32
+        #   - b_gate[T, VWN_N, VWN_M]   bf16
+        write_block = T * self.vwn_m * self.V * bf16_sz
+        write_resid = T * self.vwn_n * self.V * fp32_sz
+        write_gate  = T * self.vwn_n * self.vwn_m * bf16_sz
+        write_total = write_block + write_resid + write_gate
 
-        self._compute_info.fwd_accessed_mem = (total_read + total_write) * element_size
-        # backward: re-read outputs + write input gradients
-        self._compute_info.bwd_grad_act_accessed_mem = (
-            total_read + total_write + total_read
-        ) * element_size  # read + write_grad + re-read weights
-        self._compute_info.bwd_grad_w_accessed_mem = read_gating_weight * element_size
+        self._compute_info.fwd_accessed_mem = read_total + write_total
+        self._compute_info.bwd_grad_act_accessed_mem = 2 * read_total + write_total
+        self._compute_info.bwd_grad_w_accessed_mem = read_gw
         self._compute_info.recompute_accessed_mem = 0
 
     # ───  Method 3: activation memory  ───
     def _comp_leaf_act_info_impl(self):
         T = self._token_count
-        element_size = self.dtype_to_element_size[self.strategy.dtype]
+        bf16_sz = self.element_size              # 2
+        fp32_sz = self.dtype_to_element_size["fp32"]  # 4: residual only
 
-        # Live tensors during forward:
-        #   - x_norm[T, VWN_N, V] (RMSNorm output)
-        #   - gate_logits[T, VWN_N, G] (GEMM output)
-        #   - gate[T, VWN_N, G] (tanh output)
-        #   - y[T, A, V] (mix output)
-        #   - block_input[T, VWN_M, V] + residual[T, VWN_N, V] + b_gate[T, VWN_N, VWN_M]
-        #
         # Cache for backward:
-        #   - x[T, VWN_N, V] (input, if needed for grad)
-        #   - x_norm[T, VWN_N, V]
-        #   - gate[T, VWN_N, G]
+        #   - x_norm[T, VWN_N, V] bf16
+        #   - gate[T, VWN_N, G]    bf16
         cache_mem = (
-            T * self.vwn_n * self.V          # x_norm
-            + T * self.vwn_n * self.G         # gate (tanh output)
-        ) * element_size
+            T * self.vwn_n * self.V  * bf16_sz   # x_norm
+            + T * self.vwn_n * self.G * bf16_sz   # gate
+        )
 
         # Forward peak (all intermediates alive):
         fwd_peak = (
-            2 * T * self.vwn_n * self.V       # x + x_norm
-            + T * self.vwn_n * self.G         # gate_logits
-            + T * self.vwn_n * self.G         # gate
-            + T * self.A * self.V             # y
-            + T * (self.vwn_m + self.vwn_n) * self.V  # block_input + residual
-            + T * self.vwn_n * self.vwn_m     # b_gate
-        ) * element_size
+            T * self.vwn_n * self.V  * bf16_sz   # x (input)
+            + T * self.vwn_n * self.V  * bf16_sz   # x_norm
+            + T * self.vwn_n * self.G  * bf16_sz   # gate_logits
+            + T * self.vwn_n * self.G  * bf16_sz   # gate
+            + T * self.A        * self.V  * bf16_sz   # y (mix output)
+            + T * self.vwn_m    * self.V  * bf16_sz   # block_input
+            + T * self.vwn_n    * self.V  * fp32_sz   # residual (fp32)
+            + T * self.vwn_n * self.vwn_m * bf16_sz   # b_gate
+        )
 
-        # Backward peak (reading cached x_norm, gate; recomputing forward; writing grads):
+        # Backward peak:
         bwd_peak = (
-            2 * T * self.vwn_n * self.V       # re-read x + write dx
-            + T * self.vwn_n * self.V         # x_norm still cached
-            + T * self.vwn_n * self.G         # gate still cached
-            + T * self.A * self.V             # dy
-            + T * (self.vwn_m + self.vwn_n) * self.V  # d(block_input) + d(residual)
-        ) * element_size
+            T * self.vwn_n * self.V  * bf16_sz   # re-read x
+            + T * self.vwn_n * self.V  * bf16_sz   # dx
+            + T * self.vwn_n * self.V  * bf16_sz   # x_norm cached
+            + T * self.vwn_n * self.G  * bf16_sz   # gate cached
+            + T * self.A        * self.V  * bf16_sz   # dy
+            + T * self.vwn_m    * self.V  * bf16_sz   # d(block_input)
+            + T * self.vwn_n    * self.V  * fp32_sz   # d(residual) (fp32)
+        )
 
         self._act_info.activation_mem_cache = cache_mem
         self._act_info.fwd_peak_mem_no_cache = max(fwd_peak, cache_mem)
@@ -281,55 +276,56 @@ class VWNOutModule(MetaModule):
     # ───  Method 2: memory access  ───
     def _comp_leaf_mem_accessed_info(self):
         T = self._token_count
-        element_size = self.dtype_to_element_size[self.strategy.dtype]
+        bf16_sz = self.element_size              # 2: block_out, b_gate, y
+        fp32_sz = self.dtype_to_element_size["fp32"]  # 4: residual only
 
         # Reads:
-        #   - block_out[T, VWN_M, V] bf16
+        #   - block_out[T, VWN_M, V]  bf16
         #   - b_gate[T, VWN_N, VWN_M] bf16
-        #   - residual[T, VWN_N, V] bf16
-        read_block = T * self.vwn_m * self.V
-        read_gate = T * self.vwn_n * self.vwn_m
-        read_residual = T * self.vwn_n * self.V
-        total_read = read_block + read_gate + read_residual
+        #   - residual[T, VWN_N, V]   fp32  ← 残差用 fp32
+        read_block = T * self.vwn_m * self.V * bf16_sz
+        read_gate  = T * self.vwn_n * self.vwn_m * bf16_sz
+        read_resid = T * self.vwn_n * self.V * fp32_sz
+        read_total = read_block + read_gate + read_resid
 
         # Write:
         #   - y[T, VWN_N, V] bf16
-        write_output = T * self.vwn_n * self.V
+        write_output = T * self.vwn_n * self.V * bf16_sz
 
-        self._compute_info.fwd_accessed_mem = (total_read + write_output) * element_size
-        self._compute_info.bwd_grad_act_accessed_mem = (
-            total_read + write_output + total_read
-        ) * element_size  # re-read for backward
+        self._compute_info.fwd_accessed_mem = read_total + write_output
+        self._compute_info.bwd_grad_act_accessed_mem = 2 * read_total + write_output
         self._compute_info.bwd_grad_w_accessed_mem = 0
         self._compute_info.recompute_accessed_mem = 0
 
     # ───  Method 3: activation memory  ───
     def _comp_leaf_act_info_impl(self):
         T = self._token_count
-        element_size = self.dtype_to_element_size[self.strategy.dtype]
+        bf16_sz = self.element_size              # 2
+        fp32_sz = self.dtype_to_element_size["fp32"]  # 4: residual only
 
         # Cache for backward:
-        #   - b_gate[T, VWN_N, VWN_M]
-        #   - block_out[T, VWN_M, V]
+        #   - b_gate[T, VWN_N, VWN_M] bf16
+        #   - block_out[T, VWN_M, V]  bf16
         cache_mem = (
-            T * self.vwn_n * self.vwn_m       # b_gate
-            + T * self.vwn_m * self.V          # block_out
-        ) * element_size
+            T * self.vwn_n * self.vwn_m * bf16_sz   # b_gate
+            + T * self.vwn_m * self.V  * bf16_sz     # block_out
+        )
 
         # Forward peak:
         fwd_peak = (
-            T * self.vwn_m * self.V             # block_out
-            + T * self.vwn_n * self.vwn_m       # b_gate
-            + T * self.vwn_n * self.V           # residual
-            + 2 * T * self.vwn_n * self.V       # mixed (temp) + y (output)
-        ) * element_size
+            T * self.vwn_m * self.V  * bf16_sz       # block_out
+            + T * self.vwn_n * self.vwn_m * bf16_sz   # b_gate
+            + T * self.vwn_n * self.V  * fp32_sz       # residual (fp32)
+            + 2 * T * self.vwn_n * self.V * bf16_sz   # mixed (temp) + y
+        )
 
         # Backward peak:
         bwd_peak = (
-            cache_mem                           # cached b_gate + block_out
-            + T * self.vwn_n * self.V           # dy + d(residual)
-            + T * self.vwn_n * self.vwn_m       # d(b_gate)
-        ) * element_size
+            cache_mem                                  # cached b_gate + block_out
+            + T * self.vwn_n * self.V  * bf16_sz       # dy
+            + T * self.vwn_n * self.V  * fp32_sz       # d(residual) (fp32)
+            + T * self.vwn_n * self.vwn_m * bf16_sz    # d(b_gate)
+        )
 
         self._act_info.activation_mem_cache = cache_mem
         self._act_info.fwd_peak_mem_no_cache = max(fwd_peak, cache_mem)
