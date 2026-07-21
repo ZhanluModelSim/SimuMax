@@ -172,7 +172,26 @@ MOE模型的路由策略， 默认为"all2all"
 net 放置所用的通信组构成 / stride 计算。约束：`pp` 始终位于最外层；
 `ep`/MoE mesh 放置固定。详见 `docs/design_simu_hierarchical_network.md` 第 4 节。
 ### zero_state
-ZeRO优化配置，目前只支持zero0和1，默认为1
+ZeRO 优化配置。支持 `0`、`1` 和 `3`（FSDP，参数分片），默认为 `1`。`2`
+已声明但尚未接入。当 `zero_state >= 3` 时，由 `fsdp_mode` 字段选择 FSDP
+通信模式，见下文。对于 `zero_state <= 1`，行为保持不变（ZeRO-1 优化器状态
+分片）。详见 `docs/design_simu_zero3_fsdp.md`。
+
+### fsdp_mode
+FSDP 通信模式，仅在 `zero_state >= 3` 时有意义；默认 `"model-wise"`。合法
+取值：`"model-wise"`、`"layer-wise"`。
+
+- `"model-wise"`（默认，Phase 1）：PP 前向之前一次性 all-gather 全部参数，
+  PP 反向之后一次性 reduce-scatter 全部梯度并执行 optim step。几乎无重叠。
+  world all_reduce 屏障仍保留在尾块。注意：model-wise FSDP 相比 ZeRO-1
+  并不节省峰值显存——all-gather 缓冲区持有完整的未分片参数，因此峰值近似为
+  `完整参数 + 分片梯度 + 分片状态 + 激活`（与 `zero_state = 1` 相同）；其收益
+  仅为 ZeRO-1 已捕获的优化器状态分片。
+- `"layer-wise"`（Phase 2，尚未实现）：按 `LLMBlock` 进行 all-gather /
+  reduce-scatter，并通过 post/wait 与相邻层重叠；峰值显存更低（同一时刻只
+  gathering 一个 block 的参数），当通信超出重叠窗口时会暴露通信时间。
+
+详见 `docs/design_simu_zero3_fsdp.md` 第 4 节。
 ## 内存优化
 ### grad_reduce_in_bf16
 梯度归约是否使用bf16，默认为false

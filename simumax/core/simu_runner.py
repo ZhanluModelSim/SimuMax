@@ -135,7 +135,17 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
 
         op_block = OptimizerSimulator(perf_model, model_name)
         op_block.prefill(args, com_buff=None)
-        thread.job.append(op_block.prefill_fwd())
+        # Model-wise FSDP (zero_state >= 3): unshard (all-gather params) runs
+        # before the PP forward (prepended), reshard (reduce-scatter grads) +
+        # optim_step runs after the PP backward (appended). Otherwise the
+        # legacy ZeRO-1 tail (RS -> barrier -> optim -> AG) is appended as a
+        # single block. See docs/design_simu_zero3_fsdp.md section 4.2.
+        if getattr(perf_model.strategy, 'fsdp_mode', 'model-wise') == 'model-wise' \
+                and perf_model.strategy.zero_state >= 3:
+            thread.job.insert(0, op_block.prefill_unshard_fwd())
+            thread.job.append(op_block.prefill_reshard_step_fwd())
+        else:
+            thread.job.append(op_block.prefill_fwd())
 
         simu.threads.append(thread)
 

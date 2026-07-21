@@ -1635,11 +1635,26 @@ class PerfLLM(PerfBase):
 
         # dense
         rs_comm_size = model_info.dense_grad_bytes
-        gather_comm_size = grad_bytes_to_param_bytes(model_info.dense_grad_bytes)
-        
+        # AG (all-gather) message size: in FSDP (zero_state >= 3) each rank
+        # gathers every other rank's param shard, so the per-rank AG message
+        # size = the leaf's sharded dense_weight_bytes (already divided by the
+        # dp_cp group at zero_state >= 3, computed with the correct weight
+        # w_element_size incl. fp8). For zero_state < 3 params are not sharded
+        # and we derive the AG size from grad bytes via the dtype ratio (legacy
+        # path; kept byte-identical for zero_state <= 1, including the fp8
+        # weight case where grad_bytes_to_param_bytes overcounts by the
+        # bf16/fp8 ratio).
+        if self.strategy.zero_state >= 3:
+            gather_comm_size = model_info.dense_weight_bytes
+        else:
+            gather_comm_size = grad_bytes_to_param_bytes(model_info.dense_grad_bytes)
+
         # moe
         moe_rs_comm_size = model_info.moe_grad_bytes
-        moe_gather_comm_size = grad_bytes_to_param_bytes(model_info.moe_grad_bytes)
+        if self.strategy.zero_state >= 3:
+            moe_gather_comm_size = model_info.moe_weight_bytes
+        else:
+            moe_gather_comm_size = grad_bytes_to_param_bytes(model_info.moe_grad_bytes)
 
         dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, self.strategy.dp_net, self.strategy.dp_size*self.strategy.cp_size, dp_group="dp_cp")
         moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, self.strategy.edp_net, self.strategy.edp_size, dp_group="edp")
@@ -1728,6 +1743,29 @@ class PerfLLM(PerfBase):
         
         result["memory_reserved_ratio"] = str(self.strategy.mem_factor)
         result["peak_path"] = f"{cur_act_info.peak_path}, stage=[{cur_act_info.peak_stage}]"
+        # ZeRO-3 / FSDP analytical memory note (design doc section 4.3):
+        # for zero_state >= 3 the static weight bytes reported above are
+        # sharded, so peak_mem understates the true peak by the model-wise AG
+        # buffer (full unsharded params transiently live during fwd). The DES
+        # simulate() path models this transient buffer precisely; the
+        # analytical path does not (Phase 1 limitation).
+        if self.strategy.zero_state >= 3:
+            result["peak_ag_buffer"] = {
+                "note": (
+                    "Model-wise FSDP AG buffer (full unsharded params, "
+                    "transiently live during fwd) is NOT included in "
+                    "peak_mem above; static weight bytes are sharded. Use "
+                    "simulate() for the precise peak memory that accounts "
+                    "for the transient AG buffer."
+                ),
+                "dense_full_param_bytes": (
+                    model_info.dense_weight_bytes
+                    * (self.strategy.dp_size * self.strategy.cp_size)
+                ),
+                "moe_full_param_bytes": (
+                    model_info.moe_weight_bytes * self.strategy.edp_size
+                ),
+            }
         # Convert to human format
         convert_final_result_to_human_format(result)
         return result

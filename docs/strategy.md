@@ -180,7 +180,30 @@ and net placement of the hierarchical network model. Constraints: `pp` is
 always outermost; the `ep`/MoE mesh placement is fixed. See
 `docs/design_simu_hierarchical_network.md` section 4.
 ### zero_state
-ZeRO optimization configuration, currently only supports zero0 and zero1, default is 1
+ZeRO optimization configuration. Supports `0`, `1`, and `3` (FSDP, param
+sharding), default is `1`. `2` is declared but not yet wired. When
+`zero_state >= 3`, the `fsdp_mode` field selects the FSDP communication
+pattern; see below. For `zero_state <= 1` the behavior is unchanged (ZeRO-1
+optimizer-state sharding). See `docs/design_simu_zero3_fsdp.md`.
+
+### fsdp_mode
+FSDP communication pattern, only meaningful when `zero_state >= 3`; default
+`"model-wise"`. Valid values: `"model-wise"`, `"layer-wise"`.
+
+- `"model-wise"` (default, Phase 1): one all-gather of all params before the
+  PP forward, and one reduce-scatter of all grads + the optim step after the
+  PP backward. Minimal overlap. The world all_reduce barrier stays in the
+  tail block. Note: model-wise FSDP does NOT save peak memory vs ZeRO-1 —
+  the all-gather buffer holds the full unsharded params, so the peak is
+  approximately `full params + sharded grads + sharded states + activations`
+  (same as `zero_state = 1`); its savings are the optimizer-state sharding
+  already captured by ZeRO-1.
+- `"layer-wise"` (Phase 2, not yet implemented): per-`LLMBlock` all-gather /
+  reduce-scatter with adjacent-layer overlap via post/wait; lower peak memory
+  (one block's params gathered at a time) and exposed comm time when comm
+  exceeds the overlap window.
+
+See `docs/design_simu_zero3_fsdp.md` section 4.
 
 ## Memory Optimization
 ### grad_reduce_in_bf16

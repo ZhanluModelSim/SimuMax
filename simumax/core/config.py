@@ -311,6 +311,10 @@ class StrategyConfig(Config):
     # simulate() DES path and leaves the analytical estimate untouched.
     collective_skew: Optional[str] = None
     zero_state: int = 1
+    # FSDP communication pattern (ZeRO-3 design doc section 3). Only
+    # meaningful when zero_state >= 3; validated and warned below if set
+    # with a lower zero_state.
+    fsdp_mode: str = "model-wise"
 
     attention_sparse_ratio: float = (
         0.0  # 0.0 means dense attention; 0.5 means compute optimize for causal attention
@@ -398,6 +402,10 @@ class StrategyConfig(Config):
     ]
     valid_collective_skew = [
         "virtual_waiters",
+    ]
+    valid_fsdp_modes = [
+        "model-wise",
+        "layer-wise",
     ]
     valid_fused_mem_modes = [
         "steady_state",
@@ -732,6 +740,13 @@ class StrategyConfig(Config):
             self.world_size % self.shard_size == 0
         ), f"world_size must be divisible by pp_size * tp_size * cp_szie, but world_size = {self.world_size}, pp_size = {self.pp_size}, tp_size = {self.tp_size}, cp_size={self.cp_size}"
         assert self.zero_state in [0, 1, 2, 3], "zero_state must be in [0, 1, 2, 3]"
+        assert self.fsdp_mode in self.valid_fsdp_modes, (
+            f"fsdp_mode {self.fsdp_mode!r} must be in [{','.join(self.valid_fsdp_modes)}]"
+        )
+        if self.fsdp_mode != "model-wise" and self.zero_state < 3:
+            warnings.warn(
+                "fsdp_mode has no effect when zero_state < 3"
+            )
         assert self.recompute_granularity is None or self.recompute_granularity in self.valid_recompute_granularity, f"recompute_granularity {self.recompute_granularity} must be in [{','.join(self.valid_recompute_granularity)}]"
         assert self.recompute_layer_num >= 0
         if not self.megatron_recompute:
@@ -807,9 +822,9 @@ class StrategyConfig(Config):
             )
         if self.enable_recompute:
             warnings.warn("Recompute is currently in experimental feature.")
-        if self.zero_state in [2, 3]:
+        if self.zero_state == 2:
             warnings.warn(
-                "zero_state 2 and 3 are not supported yet, the configuration will be ignored."
+                "zero_state 2 is not supported yet, the configuration will be ignored."
             )
 
         if self.recompute_granularity == "full_block":

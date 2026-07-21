@@ -43,7 +43,62 @@ class OptimizerSimulator(MetaModule):
         rank_info = get_rank_group(args.rank, self.strategy)
         comm_info = self.perf_model._compute_dp_time(self.model_name)
         opt_info = self.perf_model._compute_optim_time(self.model_name)
-        
+
+        # Model-wise FSDP (zero_state >= 3 and fsdp_mode == "model-wise"):
+        # the unshard (all-gather params) block runs BEFORE the PP forward, and
+        # the reshard (reduce-scatter grads) + optim_step block runs AFTER the
+        # PP backward. The trailing all-gather of the legacy ZeRO-1 tail moves
+        # to the prepend block; the tail keeps the world all_reduce barrier +
+        # optim_step. See docs/design_simu_zero3_fsdp.md section 4.2.
+        fsdp_model_wise = (
+            self.strategy.zero_state >= 3
+            and getattr(self.strategy, 'fsdp_mode', 'model-wise') == 'model-wise'
+        )
+        if fsdp_model_wise:
+            cost_dense, cost_moe = comm_info['dense'], comm_info['moe']
+            # Unshard params (prepend, before PP forward): AG dense + AG moe.
+            cost_dense_ag = cost_dense['details']['all_gather_time']
+            ag_dense = all_gather(
+                f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}",
+                rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,
+                com_buff=com_buff, fwd_cost=cost_dense_ag, global_rank=args.rank,
+                net=self.strategy.dp_net)
+            state.comm_order += 1
+            cost_moe_ag = cost_moe['details']['all_gather_time']
+            ag_moe = all_gather(
+                f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}",
+                rank_info['edp_rank'], self.strategy.edp_size, com_buff=com_buff,
+                fwd_cost=cost_moe_ag, global_rank=args.rank, net=self.strategy.edp_net)
+            state.comm_order += 1
+            self._unshard_layers = [ag_dense, ag_moe]
+            # Reshard grads + optim step (append, after PP backward): RS dense
+            # -> RS moe -> world all_reduce barrier -> optim_step. No trailing
+            # all_gather (it moved to the prepend block above).
+            cost_dense_rs = cost_dense['details']['reduce_scatter_time']
+            rs_dense = reduce_scatter(
+                f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}",
+                rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,
+                com_buff=com_buff, fwd_cost=cost_dense_rs, global_rank=args.rank,
+                net=self.strategy.dp_net)
+            state.comm_order += 1
+            cost_moe_rs = cost_moe['details']['reduce_scatter_time']
+            rs_moe = reduce_scatter(
+                f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}",
+                rank_info['edp_rank'], self.strategy.edp_size, com_buff=com_buff,
+                fwd_cost=cost_moe_rs, global_rank=args.rank, net=self.strategy.edp_net)
+            state.comm_order += 1
+            barrier = all_reduce(
+                f"default_group-pp_size:{self.strategy.pp_size}",
+                args.rank, self.strategy.world_size, com_buff=com_buff,
+                fwd_cost=1, global_rank=args.rank)
+            optim_step = AtomModel(
+                fwd_cost=opt_info['optim_time'], bwd_cost=0,
+                specific_name='optimizer_step')
+            self._reshard_step_layers = [rs_dense, rs_moe, barrier, optim_step]
+            for layer in self._unshard_layers + self._reshard_step_layers:
+                layer.prefill(args, self.call_stk, com_buff=com_buff)
+            return
+
         if self.strategy.zero_state >= 1:
             # optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size, set comm_num accordingly
             cost_dense, cost_moe = comm_info['dense'], comm_info['moe']
@@ -85,6 +140,37 @@ class OptimizerSimulator(MetaModule):
 
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
+
+    def prefill_unshard_fwd(self):
+        """Model-wise FSDP unshard block: all-gather sharded params.
+
+        Returns a ``FwdQue`` wrapping ``all_gather(dense params, dp_cp_group)``
+        and ``all_gather(moe params, edp_group)``. Built only when
+        ``zero_state >= 3`` and ``fsdp_mode == "model-wise"``; intended to be
+        prepended before the PP forward so the schedule runs with full params.
+        The world all_reduce barrier is NOT here -- it stays in the reshard +
+        optim_step tail (``prefill_reshard_step_fwd``). See
+        ``docs/design_simu_zero3_fsdp.md`` section 4.2.
+        """
+        fwd = FwdQue(call_stk=self.call_stk)
+        for layer in self._unshard_layers:
+            fwd.append(layer.prefill_fwd())
+        return fwd
+
+    def prefill_reshard_step_fwd(self):
+        """Model-wise FSDP reshard + optim step tail.
+
+        Returns a ``FwdQue`` wrapping ``reduce_scatter(dense)`` ->
+        ``reduce_scatter(moe)`` -> ``all_reduce(world barrier)`` ->
+        ``AtomModel(optim_step)``. No trailing all_gather (it moved to the
+        prepend block). Built only when ``zero_state >= 3`` and
+        ``fsdp_mode == "model-wise"``; intended to be appended after the PP
+        backward. See ``docs/design_simu_zero3_fsdp.md`` section 4.2.
+        """
+        fwd = FwdQue(call_stk=self.call_stk)
+        for layer in self._reshard_step_layers:
+            fwd.append(layer.prefill_fwd())
+        return fwd
 
 class ScheduleBuilder:
     """Interface for pipeline-schedule job-list builders.
