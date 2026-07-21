@@ -34,6 +34,7 @@ from simumax.core.simu_memory import OpMemoryProfile
 from simumax.core.utils import get_point_name, to_json_string
 from simumax.core.utils import get_rank_group
 from simumax.core.utils import group_node_stats, estimate_straggler_increase_ratio
+from simumax.core.utils import group_level_span
 from simumax.core.graph import SimuONNXGraphBuilder
 
 class FwdQue:
@@ -1334,7 +1335,8 @@ class P2PBackend:
 
 
 class NetworkFabric:
-    """Per-GPU NIC servers (+ reserved per-node ToR servers).
+    """Per-GPU NIC servers (+ reserved per-node ToR servers, + optional
+    per-level link servers).
 
     One NIC server per GPU, keyed by global rank; one reserved ToR server per
     node, keyed by ``rank // num_per_node``. Server state is a single tail
@@ -1343,6 +1345,14 @@ class NetworkFabric:
     only shift its ``launch_t``/``ready_t`` (network-fabric design doc 5.3).
     ToR servers default to non-constraining (pass-through) until
     ``tor_enabled`` is switched on (design doc 5.1/5.5, decision 3).
+
+    Hierarchical level servers (hierarchical-network design doc section 8,
+    ``fabric_model="nic+levels"``) add one logical link server per
+    (level, unit), keyed ``level_tail[(level_idx, unit)]`` for
+    ``level_idx >= 1``; level 0 is the node level and its server stays the
+    existing per-node ToR (``tor_tail``) — the two are unified, never
+    duplicated. Until ``set_level_topology()`` is called the fabric behaves
+    exactly as the NIC(+ToR)-only model.
     """
 
     def __init__(self, num_per_node, tor_enabled=False, tor_node_share=1,
@@ -1356,15 +1366,66 @@ class NetworkFabric:
         self.tor_capacity_gbps = tor_capacity_gbps
         self.nic_tail = defaultdict(float)  # rank -> NIC busy until
         self.tor_tail = defaultdict(float)  # node -> ToR busy until
+        # Hierarchical level servers; inert until set_level_topology().
+        self.levels = None              # raw topology levels, innermost first
+        self.level_spans = []           # cumulative GPUs per unit of level i
+        self.level_capacities = []      # gbps, index-aligned with levels
+        self.level_share = []           # occupancy amplification per level
+        self.level_tail = defaultdict(float)  # (level_idx>=1, unit) -> busy until
+
+    def set_level_topology(self, levels, level_capacities, merge_lanes):
+        """Activate per-level link servers (hierarchical-network doc sec. 8).
+
+        ``levels``: topology levels (innermost first), each
+        ``{"name", "size", "net"}``; ``level_capacities[i]`` is the service
+        rate (gbps) of level i's links, resolved by the caller from
+        ``networks[levels[i]["net"]]``. ``level_share[i]`` is the merge_lanes
+        amplification — active ranks per unit / simulated ranks per unit,
+        i.e. the unit's span under merge_lanes, else 1.
+        """
+        self.levels = levels
+        self.level_capacities = list(level_capacities)
+        cumulative = 1
+        self.level_spans = []
+        for entry in levels:
+            cumulative *= int(entry["size"])
+            self.level_spans.append(cumulative)
+        self.level_share = [span if merge_lanes else 1 for span in self.level_spans]
+        self.level_tail = defaultdict(float)
+
+    def level_topology_active(self):
+        return self.levels is not None
+
+    def level_crossings(self, rank_a, rank_b):
+        """Levels (>= 1) whose unit boundary separates the two ranks.
+
+        Symmetric in the endpoints, so either op of a p2p pair can compute it.
+        Level 0 (node) is never reported: inter-node pairs are already ToR
+        charged, and level_tail holds no level-0 keys.
+        """
+        if self.levels is None:
+            return []
+        return [i for i in range(1, len(self.level_spans))
+                if rank_a // self.level_spans[i] != rank_b // self.level_spans[i]]
 
     def node_of(self, rank):
         return rank // self.num_per_node
 
-    def acquire(self, rank, t):
-        """Earliest start on rank's NIC (and ToR when enabled)."""
+    def acquire(self, rank, t, crossed_levels=None):
+        """Earliest start on rank's NIC (and ToR / crossed level links).
+
+        ``crossed_levels=None`` keeps the legacy NIC(+ToR) behavior of the
+        existing call sites; an explicit list additionally serializes on the
+        crossed (level, unit) link servers.
+        """
         t = max(t, self.nic_tail[rank])
         if self.tor_enabled:
             t = max(t, self.tor_tail[self.node_of(rank)])
+        if crossed_levels:
+            for i in crossed_levels:
+                if i < 1 or i >= len(self.level_spans):
+                    continue  # Level 0 is the ToR, handled above.
+                t = max(t, self.level_tail[(i, rank // self.level_spans[i])])
         return t
 
     def tor_occupancy(self, cost, size_bytes):
@@ -1383,6 +1444,19 @@ class NetworkFabric:
                     * self.tor_node_share)
         return cost * self.tor_node_share / self.num_per_node
 
+    def level_occupancy(self, level_idx, cost, size_bytes):
+        """Service time of one entry on a level link (ms), amplified by
+        level_share. Mirrors ``tor_occupancy``: size-based when capacity and
+        size are known; fallback ``cost * share / span`` (neutral under
+        merge_lanes, where share == span, like the ToR default).
+        """
+        capacity = (self.level_capacities[level_idx]
+                    if level_idx < len(self.level_capacities) else None)
+        if size_bytes and capacity:
+            return (size_bytes / (capacity * 1024**3) * 1e3
+                    * self.level_share[level_idx])
+        return cost * self.level_share[level_idx] / self.level_spans[level_idx]
+
     def charge(self, rank, end_t, cost, size_bytes=0):
         self.nic_tail[rank] = max(self.nic_tail[rank], end_t)
         if self.tor_enabled:
@@ -1390,6 +1464,30 @@ class NetworkFabric:
             launch_t = end_t - cost
             self.tor_tail[node] = max(
                 self.tor_tail[node], launch_t + self.tor_occupancy(cost, size_bytes)
+            )
+
+    def charge_levels(self, rank, end_t, cost, size_bytes=0, crossed_levels=None):
+        """``charge()`` plus one charge per crossed level link server.
+
+        The unit index derives from THIS rank (``rank // span_i``), so the
+        two endpoints of a p2p pair — charged separately, each with its own
+        rank — cover both sides' unit servers (design doc 8 route:
+        NIC(src), link(level, src_unit), ..., NIC(dst)). Level 0 is skipped:
+        the node level's server is the ToR, already charged by the base path
+        when enabled. With no level topology or no crossed levels this
+        degenerates to exactly ``charge()``.
+        """
+        self.charge(rank, end_t, cost, size_bytes=size_bytes)
+        if not crossed_levels or self.levels is None:
+            return
+        launch_t = end_t - cost
+        for i in crossed_levels:
+            if i < 1 or i >= len(self.level_spans):
+                continue  # Level 0 is the ToR, handled by charge().
+            unit = rank // self.level_spans[i]
+            self.level_tail[(i, unit)] = max(
+                self.level_tail[(i, unit)],
+                launch_t + self.level_occupancy(i, cost, size_bytes),
             )
 
 
@@ -1619,13 +1717,17 @@ class SimuSystem:
                 # Blocking p2p charges BOTH ends (decision 1): every waiter's
                 # NIC is set to the common barrier end_t, applied in the same
                 # drain that raises their lane clocks. Keyed on the gid so
-                # retried/cached completions never double-charge.
+                # retried/cached completions never double-charge. Under a
+                # level topology the payload also carries the pair's crossed
+                # levels; each waiter's charge_levels derives its own unit
+                # (rank // span_i), so both endpoints' link servers charge.
                 if fabric_charge is not None and gid not in fabric_charged_gids:
                     fabric_charged_gids.add(gid)
-                    charge_end_t, charge_cost, charge_size = fabric_charge
+                    charge_end_t, charge_cost, charge_size, charge_crossed = fabric_charge
                     for w in waiters:
-                        ctx.fabric.charge(w, charge_end_t, charge_cost,
-                                          size_bytes=charge_size)
+                        ctx.fabric.charge_levels(w, charge_end_t, charge_cost,
+                                                 size_bytes=charge_size,
+                                                 crossed_levels=charge_crossed)
             while ctx.pending_comm_entry_completions:
                 eid = ctx.pending_comm_entry_completions.pop()
                 to_unblock = [w for w, wait_key in list(blocked_on.items()) if wait_key == ("comm_entry", eid)]
@@ -1687,6 +1789,7 @@ class SimuContext:
         self.backend = backend
         self.p2p_backend = P2PBackend()
         self.pending_completions = []  # list[(gid, waiters, end_t, stream, fabric_charge)]
+        # fabric_charge: None, or (end_t, cost, size_bytes, crossed_levels)
         self.pending_comm_entry_completions = []  # list[eid]
         self.pending_async_finalizations = []  # list[gid], LIFO for compatibility
         self.pending_async_posts = []  # list[gid], LIFO for compatibility
@@ -1803,6 +1906,7 @@ class SimuContext:
             meta={"post_order": order, "post_ts": post_t, "net": net, "size_bytes": size_bytes},
         )
         self.attach_async_send_eid(gid, eid)
+        self._stamp_async_crossed_levels(gid)
         self.pump_comm_queue()
         return eid
 
@@ -1844,8 +1948,80 @@ class SimuContext:
             meta={"post_order": order, "post_ts": post_t, "net": net, "size_bytes": size_bytes},
         )
         self.attach_async_recv_eid(gid, eid)
+        self._stamp_async_crossed_levels(gid)
         self.pump_comm_queue()
         return eid
+
+    def _stamp_pair_levels_meta(self, meta, send_rank, recv_rank):
+        """Compute the fabric level meta of one p2p pair (both ranks known).
+
+        ``crossed_levels``: levels (>= 1) whose unit boundary separates the
+        endpoints (symmetric in the ranks). For net="levels" entries also
+        ``fabric_egress``: whether the pair sits on different nodes (level-0
+        units) — same-node pairs stay on the intra-node fabric and engage
+        no fabric server at all. net="inter_node" entries need no egress
+        flag: their explicit marking already engages NIC(+ToR) as before.
+        """
+        fabric = self.fabric
+        meta["crossed_levels"] = fabric.level_crossings(send_rank, recv_rank)
+        if meta.get("net") == "levels":
+            span0 = fabric.level_spans[0]
+            meta["fabric_egress"] = send_rank // span0 != recv_rank // span0
+
+    def _stamp_async_crossed_levels(self, gid):
+        """Backfill ``crossed_levels`` into an async p2p pair's entry metas.
+
+        No-op unless the hierarchical fabric is active (ctx.levels set and
+        fabric level topology on) — legacy paths keep their exact meta shape.
+        Computed once both endpoint ranks are known (the second post sees
+        both); entries not yet done can still be stamped, and a p2p entry
+        cannot complete before both posts, so stamping here always precedes
+        the fabric charge. ``_complete_comm_entry`` re-checks at completion.
+        """
+        fabric = self.fabric
+        if (fabric is None or not fabric.level_topology_active()
+                or not getattr(self, "levels", None)):
+            return
+        state = self.get_async_state(gid)
+        if state.send_rank is None or state.recv_rank is None:
+            return
+        for eid in (state.send_eid, state.recv_eid):
+            if eid is None:
+                continue
+            entry = self.comm_entries.get(eid)
+            if entry is None or entry.status == "done":
+                continue
+            if entry.meta.get("net") not in ("inter_node", "levels"):
+                continue
+            if "crossed_levels" not in entry.meta:
+                self._stamp_pair_levels_meta(
+                    entry.meta, state.send_rank, state.recv_rank)
+
+    def _fabric_entry_engagement(self, entry):
+        """(engages, crossed_levels) of the fabric for one comm entry.
+
+        net=="inter_node" (legacy explicit marking): always engages when a
+        fabric exists; crossed comes from the meta (None without a level
+        topology, so charge/acquire degenerate to NIC+ToR exactly as before).
+        net=="levels" (net-field semantics C, design doc section 7): engages
+        only under an active level topology, and only for traffic leaving
+        the node — collectives with a phase at level >= 1 (composition
+        c_i > 1), p2p pairs on different nodes (meta["fabric_egress"];
+        conservatively True before the peer post stamps it, matching the
+        legacy unconditional NIC acquire at arrival).
+        """
+        if self.fabric is None:
+            return False, None
+        net = entry.meta.get("net")
+        if net == "inter_node":
+            return True, entry.meta.get("crossed_levels")
+        if (net == "levels" and self.fabric.level_topology_active()
+                and getattr(self, "levels", None)):
+            crossed = entry.meta.get("crossed_levels")
+            if entry.backend_kind == "p2p":
+                return entry.meta.get("fabric_egress", True), crossed
+            return bool(crossed) and any(i >= 1 for i in crossed), crossed
+        return False, None
 
     def attach_async_send_eid(self, gid, eid):
         state = self.get_async_state(gid)
@@ -1994,9 +2170,27 @@ class SimuContext:
         # Uniform fabric charge (network-fabric design doc 5.3): covers local
         # entries, rendezvous waiters, and async p2p send/recv entries (both
         # ends get their own entries, so both ends are charged — decision 1).
-        if self.fabric is not None and entry.meta.get("net") == "inter_node":
-            self.fabric.charge(rank, end_t, entry.cost,
-                               size_bytes=entry.meta.get("size_bytes", 0))
+        # Under a level topology the entry's crossed_levels (stamped at issue
+        # for collectives, at post for async p2p) also charge the per-level
+        # link servers (hierarchical-network design doc section 8).
+        if self.fabric is not None and entry.backend_kind == "p2p":
+            # Completion-time fallback for async p2p: both endpoint ranks
+            # are known once the pair completed, even if the posts never got
+            # to stamp the meta (covers "levels" egress too).
+            if ("crossed_levels" not in entry.meta
+                    and entry.meta.get("net") in ("inter_node", "levels")
+                    and self.fabric.level_topology_active()
+                    and getattr(self, "levels", None)):
+                state = self.async_states.get(entry.gid)
+                if (state is not None and state.send_rank is not None
+                        and state.recv_rank is not None):
+                    self._stamp_pair_levels_meta(
+                        entry.meta, state.send_rank, state.recv_rank)
+        engages, crossed = self._fabric_entry_engagement(entry)
+        if engages:
+            self.fabric.charge_levels(rank, end_t, entry.cost,
+                                      size_bytes=entry.meta.get("size_bytes", 0),
+                                      crossed_levels=crossed)
         if self.threads_by_rank is not None and rank in self.threads_by_rank:
             self.threads_by_rank[rank].t[entry.stream] = max(self.threads_by_rank[rank].t[entry.stream], end_t)
         self.pending_comm_entry_completions.append(eid)
@@ -2035,10 +2229,12 @@ class SimuContext:
         entry = self.comm_entries[eid]
         rank = entry.rank
         launch_t = max(entry.issue_t, self.get_rank_comm_tail(rank, entry.stream))
-        # Inter-node ops additionally serialize on the rank's NIC (and ToR
-        # when enabled); the fabric only shifts launch_t, never cost.
-        if self.fabric is not None and entry.meta.get("net") == "inter_node":
-            launch_t = self.fabric.acquire(rank, launch_t)
+        # Engaged ops additionally serialize on the rank's NIC (and ToR when
+        # enabled, and any crossed level link servers); the fabric only
+        # shifts launch_t, never cost.
+        engages, crossed = self._fabric_entry_engagement(entry)
+        if engages:
+            launch_t = self.fabric.acquire(rank, launch_t, crossed)
         end_t = launch_t + entry.cost
         # Phase C "virtual waiters" (network-fabric design doc section 8): a
         # local collective really completes when the slowest member of its
@@ -2067,10 +2263,12 @@ class SimuContext:
             # actually arrive.
             return
         ready_t = max(entry.issue_t, self.get_rank_comm_tail(rank, entry.stream))
-        # Each inter-node waiter acquires its NIC (and ToR when enabled)
-        # before arriving at the backend (network-fabric design doc 5.3).
-        if self.fabric is not None and entry.meta.get("net") == "inter_node":
-            ready_t = self.fabric.acquire(rank, ready_t)
+        # Each engaged waiter acquires its NIC (and ToR when enabled, and any
+        # crossed level link servers) before arriving at the backend
+        # (network-fabric design doc 5.3).
+        engages, crossed = self._fabric_entry_engagement(entry)
+        if engages:
+            ready_t = self.fabric.acquire(rank, ready_t, crossed)
         entry.ready_t = ready_t
         if entry.backend_kind == "p2p":
             done, waiters, end_t = self.p2p_backend.arrive(entry.gid, rank, ready_t, entry.cost)
@@ -2107,8 +2305,10 @@ class SimuContext:
                 waiter_ready_t = max(
                     waiter_entry.issue_t, self.get_rank_comm_tail(waiter_rank, waiter_entry.stream)
                 )
-                if self.fabric is not None and waiter_entry.meta.get("net") == "inter_node":
-                    waiter_ready_t = self.fabric.acquire(waiter_rank, waiter_ready_t)
+                w_engages, w_crossed = self._fabric_entry_engagement(waiter_entry)
+                if w_engages:
+                    waiter_ready_t = self.fabric.acquire(
+                        waiter_rank, waiter_ready_t, w_crossed)
                 waiter_entry.ready_t = waiter_ready_t
             launch_t = max(waiter_ready_t, end_t - waiter_entry.cost)
             self._complete_comm_entry(waiter_eid, launch_t, end_t)
@@ -2478,7 +2678,34 @@ class Com(LeafModel):
             self._bwd_done_t = None
             return True, None
         return False, blk
-        
+
+    def _issue_meta(self, ctx):
+        """Meta dict for the comm entry issued by _step/_bwd.
+
+        Under an active level topology (ctx.levels set by the runner AND
+        fabric.set_level_topology called), collectives additionally carry
+        ``crossed_levels``: the topology levels whose links this collective's
+        traffic crosses, from the T2 composition — level i is crossed iff
+        composition[i] > 1 (a phase exists at that level). This applies to
+        net=="inter_node" entries and to net=="levels" entries (net-field
+        semantics C): for the latter the fabric engages only when a level
+        >= 1 is crossed (traffic leaves the node; a [0]-only crossed list
+        is an intra-node phase and engages nothing). Level 0 has no
+        level_tail entry — its server is the ToR.
+        """
+        meta = {"net": self.net, "size_bytes": self.size_bytes}
+        levels = getattr(ctx, "levels", None)
+        fabric = ctx.fabric
+        if (self.net in ("inter_node", "levels") and levels
+                and fabric is not None and fabric.level_topology_active()):
+            kind = _parse_group_kind(self.id)
+            strategy = getattr(ctx, "strategy", None)
+            if kind is not None and strategy is not None:
+                composition, _ = group_level_span(kind, strategy, levels)
+                meta["crossed_levels"] = [
+                    i for i, c in enumerate(composition) if c > 1]
+        return meta
+
     def _step(self, t, ctx):
         if self.global_rank is None:
             raise RuntimeError(f"Com {self.id}: global_rank is None")
@@ -2512,7 +2739,7 @@ class Com(LeafModel):
                 expected=expected,
                 log_call_stk=self.call_stk,
                 log_id=self.id,
-                meta={"net": self.net, "size_bytes": self.size_bytes},
+                meta=self._issue_meta(ctx),
             )
             # Faithful post marker (design doc 9.3): the post happens at issue;
             # the completion span follows from the step wrapper as before.
@@ -2559,7 +2786,7 @@ class Com(LeafModel):
                 expected=expected,
                 log_call_stk=self.call_stk,
                 log_id=self.id,
-                meta={"net": self.net, "size_bytes": self.size_bytes},
+                meta=self._issue_meta(ctx),
             )
             # Faithful post marker (design doc 9.3): the post happens at issue;
             # the completion span follows from the bwd wrapper as before.
@@ -2588,10 +2815,16 @@ class Com(LeafModel):
         m = max(t["comp"], t["comm"])
         t["comp"] = t["comm"] = m
         ready_t = self._batch_submit_by_gid.get(gid, t[self.stream])
-        # Inter-node blocking p2p acquires this rank's NIC (and ToR when
-        # enabled) at arrival; only first arrivals use ready_t, so retries
-        # re-acquire harmlessly (network-fabric design doc 5.3).
-        if ctx.fabric is not None and self.net == "inter_node":
+        # Blocking p2p acquires this rank's NIC (and ToR when enabled) at
+        # arrival; only first arrivals use ready_t, so retries re-acquire
+        # harmlessly (network-fabric design doc 5.3). net=="levels" pairs
+        # acquire conservatively here too (the egress node check needs the
+        # peer rank, known only at completion; the charge below is exact).
+        topology_on = (ctx.fabric is not None
+                       and ctx.fabric.level_topology_active()
+                       and getattr(ctx, "levels", None))
+        if ctx.fabric is not None and (
+                self.net == "inter_node" or (self.net == "levels" and topology_on)):
             ready_t = ctx.fabric.acquire(self.global_rank, ready_t)
         first_arrival = gid not in self._blocking_start_by_gid
         done, waiters, end_t = ctx.backend.arrive(gid, self.global_rank, ready_t, 2, cost)
@@ -2622,7 +2855,28 @@ class Com(LeafModel):
             # Both waiters' NICs are charged to the COMMON barrier end_t (not
             # the replay-adjusted local one) by the pending_completions drain,
             # keyed on the gid so retries never double-charge (decision 1).
-            fabric_charge = (end_t, cost, self.size_bytes or 0)
+            crossed = None
+            if topology_on and len(waiters) == 2:
+                # The pair's crossed levels, computed once here by whichever
+                # op observes the completion (the relation is symmetric in
+                # the two ranks). The drain calls each waiter's charge_levels
+                # with its own rank, so the per-unit index (rank // span_i)
+                # covers both endpoints' link servers. Arrival-time acquire
+                # above stays NIC+ToR only: the peer rank (and thus the
+                # crossed set) is unknown until both waiters arrive.
+                crossed = ctx.fabric.level_crossings(waiters[0], waiters[1])
+            fabric_charge = (end_t, cost, self.size_bytes or 0, crossed)
+        elif ctx.fabric is not None and self.net == "levels" and topology_on:
+            # Semantics-C pair: engage the fabric only when the endpoints
+            # sit on different nodes (level-0 units); same-node pairs stay
+            # on the intra-node fabric and charge nothing. Crossed level
+            # servers (>= 1) follow the same endpoint rule as inter_node.
+            if len(waiters) == 2:
+                rank_a, rank_b = waiters
+                span0 = ctx.fabric.level_spans[0]
+                if rank_a // span0 != rank_b // span0:
+                    fabric_charge = (end_t, cost, self.size_bytes or 0,
+                                     ctx.fabric.level_crossings(rank_a, rank_b))
         end_t = max(end_t, t["comp"], t["comm"])
         t["comp"] = t["comm"] = end_t
         self._batch_submit_by_gid.pop(gid, None)

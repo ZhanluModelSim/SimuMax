@@ -447,6 +447,18 @@ Optional fields enabling the network-fabric contention model of the DES
   reproduces the current behavior; `"nic"` enables per-GPU NIC servers so
   that `inter_node` ops queue on their rank's NIC; `"nic+tor"`
   additionally activates top-of-rack (ToR) servers (Preview).
+- `fabric_model: "nic+levels"` (Preview) keeps the per-GPU NIC servers and
+  additionally activates one logical link server per `(level, unit)`
+  declared in `topology.levels` — `(pod, pod_id)`, `(rack, rack_id)`, … —
+  with capacity from the level's net profile, shared by the unit's active
+  members via `node_share` generalized to `level_share` (under
+  `merge_lanes` the per-level amplification is active ranks per unit /
+  simulated ranks per unit, i.e. the unit span). It requires
+  `topology.levels` (validated). Link occupancy follows the same
+  size-based formula as the NIC/ToR servers — an op holds the link for
+  its whole transfer time at its share of the level capacity, so the same
+  overcharge caveats apply. See section 8 of
+  [design_simu_hierarchical_network.md](./design_simu_hierarchical_network.md).
 - `topology.tor_capacity_gbps`: ToR server capacity; defaults to
   `inter_node.gbps` (the node uplink).
 - `topology.tor_node_share`: `"auto"` or a number >= 1. `"auto"` resolves
@@ -464,7 +476,9 @@ It models clusters with more than one link hierarchy — N GPUs per node via
 link A, M nodes per pod via link B, P pods per rack via link C — and charges
 every communication domain through the levels it actually spans. When
 `topology.levels` is absent, results are bit-identical to the flat two-level
-model.
+model. The same declaration also backs the fabric level servers of
+`fabric_model="nic+levels"` (see the section above and section 8 of the
+design doc); on its own it only drives the analytical cost path.
 
 ```json
 "topology": {

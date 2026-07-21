@@ -935,7 +935,9 @@ class SystemConfig(Config):
     engines: Optional[Dict[str, dict]] = None
     # Network fabric model selection (network-fabric design doc section 6):
     # None = off (current behavior), "nic" = per-GPU NIC servers,
-    # "nic+tor" = additionally activates ToR servers (Preview).
+    # "nic+tor" = additionally activates ToR servers (Preview),
+    # "nic+levels" = per-GPU NIC + per-level link servers (Preview,
+    # hierarchical-network design doc section 8); requires topology["levels"].
     fabric_model: Optional[str] = None
     # Fabric topology knobs; reserved keys are "tor_capacity_gbps"
     # (number) and "tor_node_share" ("auto" or number >= 1).
@@ -1592,7 +1594,10 @@ class SystemConfig(Config):
     RESERVED_RESOURCE_LANES = ("comp", "comm", "pp_fwd", "pp_bwd", "off")
 
     # Fabric model choices (network-fabric design doc section 6); None = off.
-    FABRIC_MODELS = ("nic", "nic+tor")
+    # "nic+levels" (hierarchical-network design doc section 8) activates
+    # per-level link servers on top of the per-GPU NIC servers and requires
+    # topology["levels"].
+    FABRIC_MODELS = ("nic", "nic+tor", "nic+levels")
     # Reserved keys of the `topology` dict.
     RESERVED_TOPOLOGY_KEYS = ("tor_capacity_gbps", "tor_node_share")
     # Reserved pseudo-net name selecting the hierarchical levels cost path
@@ -1663,8 +1668,17 @@ class SystemConfig(Config):
     def _sanity_check_fabric(self):
         assert self.fabric_model in (None, *self.FABRIC_MODELS), (
             f"fabric_model must be one of None, 'nic', 'nic+tor', "
-            f"but got {self.fabric_model!r}"
+            f"'nic+levels', but got {self.fabric_model!r}"
         )
+        if self.fabric_model == "nic+levels":
+            # The fabric builds one link server per (level, unit) from
+            # topology["levels"] (hierarchical-network design doc section
+            # 8); each level's net reference is validated in
+            # _validate_topology_levels below.
+            assert self.topology is not None and "levels" in self.topology, (
+                "fabric_model 'nic+levels' requires topology['levels'] to be "
+                "declared (hierarchical-network design doc section 8)"
+            )
         if self.topology is None:
             return
         assert isinstance(self.topology, dict), (
@@ -1678,7 +1692,7 @@ class SystemConfig(Config):
             # levels cost path), so it does not trigger this warning.
             warnings.warn(
                 "topology is set but fabric_model is None; topology is only "
-                "meaningful with fabric_model 'nic' or 'nic+tor'"
+                "meaningful with fabric_model 'nic', 'nic+tor' or 'nic+levels'"
             )
         if "composition_policy" in self.topology and "levels" not in self.topology:
             warnings.warn(

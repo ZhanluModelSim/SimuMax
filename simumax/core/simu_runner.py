@@ -50,6 +50,7 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     # Network fabric servers (network-fabric design doc sections 5-6);
     # None = off, which reproduces the current behavior.
     fabric = None
+    levels = None
     model = getattr(perf_model.system, "fabric_model", None)
     if model in ("nic", "nic+tor"):
         topo = perf_model.system.topology or {}
@@ -68,7 +69,25 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
             tor_node_share=share,
             tor_capacity_gbps=tor_capacity,
         )
+    elif model == "nic+levels":
+        # Hierarchical fabric (hierarchical-network design doc section 8):
+        # per-GPU NIC servers plus one logical link server per (level, unit).
+        # topology["levels"] is required by the SystemConfig sanity check.
+        levels = perf_model.system.topology["levels"]
+        # Per-level link capacity in gbps, resolved from each level's net
+        # profile (level["net"] -> networks[net].bandwidth.gbps).
+        level_capacities = [
+            perf_model.system.networks[level["net"]].bandwidth.gbps
+            for level in levels
+        ]
+        fabric = NetworkFabric(perf_model.system.num_per_node)
+        fabric.set_level_topology(levels, level_capacities, merge_lanes)
     ctx.fabric = fabric
+    # Level routing context of the DES; set only under "nic+levels". A
+    # topology["levels"] list may still exist in the config for the
+    # analytical levels cost path (net field "auto") — fabric charging
+    # stays off unless fabric_model is set.
+    ctx.levels = levels
 
     if merge_lanes:
         simu_ranks = perf_model.strategy.pp_size
