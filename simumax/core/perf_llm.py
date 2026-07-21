@@ -1679,22 +1679,27 @@ class PerfLLM(PerfBase):
         return all_result
 
     def _compute_layer_wise_fsdp_exposed_time(self, model_name):
-        """Analytical overlap estimate for layer-wise FSDP (design doc 5.1).
+        """Analytical overlap estimate for layer-wise FSDP (FSDP2 gap analysis
+        doc section 3.7).
 
         For each ``LLMBlock`` in the model chunk, the per-block all-gather
-        (param unshard, fwd) and reduce-scatter (grad reshard, bwd) costs are
-        overlapped with the *previous* block's fwd compute and the *next*
-        block's bwd compute respectively. The first block's AG has no previous
-        block to overlap with -> fully exposed; the last block's RS has no
-        next block -> fully exposed. The result is a conservative upper bound
-        on the non-overlappable comm fraction; the DES ``simulate()`` path
-        gives the precise value via post/wait scheduling.
+        (param unshard) and reduce-scatter (grad reshard) costs are overlapped
+        with adjacent blocks' compute. The formula differs by sharding strategy:
 
-        Dense params/grads use the ``dp_cp`` group; MoE expert params/grads use
-        the ``edp`` group and are added to the same per-block comm cost. Per-
-        block compute times come from the existing chunk-level
-        ``_compute_single_batch_phase_inputs`` (fwd/bwd compute) divided by the
-        number of blocks.
+        FULL_SHARD (reshard_after_forward=True, default):
+          - Forward AG(i) overlaps with fwd_compute(i-1). AG(0) exposed.
+          - Backward AG(i) overlaps with bwd_compute(i+1). AG(n-1) exposed.
+          - Backward RS(i) overlaps with bwd_compute(i-1). RS(0) exposed.
+
+        SHARD_GRAD_OP (reshard_after_forward=False):
+          - Forward AG(i) overlaps with fwd_compute(i-1). AG(0) exposed.
+          - No backward AG.
+          - Backward RS(i) overlaps with bwd_compute(i-1). RS(0) exposed.
+
+        The result is a conservative upper bound on the non-overlappable comm
+        fraction; the DES ``simulate()`` path gives the precise value via
+        post/wait scheduling. Prefetch layers > 1 are not modeled in the
+        analytical estimate (conservative — DES gives the precise value).
         """
         chunk = self.model_chunk_dict[model_name]
         layer_num = getattr(chunk, 'layer_num', 0)
@@ -1771,17 +1776,32 @@ class PerfLLM(PerfBase):
             ag_list.append(ag)
             rs_list.append(rs)
 
-        # Forward: AG for block i overlaps with compute of block i-1. Block 0
-        # has no predecessor -> its AG is fully exposed.
+        # Forward: AG for block i overlaps with fwd_compute of block i-1.
+        # Block 0 has no predecessor -> its AG is fully exposed.
         fwd_exposed = ag_list[0]
         for i in range(1, n):
             fwd_exposed += max(0.0, ag_list[i] - fwd_per_block)
-        # Backward: RS for block i overlaps with compute of block i+1. The last
-        # block has no successor -> its RS is fully exposed.
-        bwd_exposed = rs_list[n - 1]
-        for i in range(n - 1):
-            bwd_exposed += max(0.0, rs_list[i] - bwd_per_block)
-        return fwd_exposed + bwd_exposed
+
+        reshard = getattr(self.strategy, 'reshard_after_forward', True)
+        if reshard:
+            # FULL_SHARD: backward also has AG. AG(i) overlaps with
+            # bwd_compute(i+1) (the block that runs before i in backward
+            # order and posts AG(i) during its prefetch). Block n-1 (first
+            # backward) has no predecessor -> AG(n-1) fully exposed.
+            bwd_ag_exposed = ag_list[n - 1]
+            for i in range(n - 1):
+                bwd_ag_exposed += max(0.0, ag_list[i] - bwd_per_block)
+        else:
+            bwd_ag_exposed = 0.0
+
+        # Backward: RS for block i overlaps with bwd_compute of block i-1
+        # (the next block in backward order). Block 0 (last backward) has
+        # no successor -> its RS is fully exposed.
+        bwd_rs_exposed = rs_list[0]
+        for i in range(1, n):
+            bwd_rs_exposed += max(0.0, rs_list[i] - bwd_per_block)
+
+        return fwd_exposed + bwd_ag_exposed + bwd_rs_exposed
 
     def _analysis_mem_impl(
         self,

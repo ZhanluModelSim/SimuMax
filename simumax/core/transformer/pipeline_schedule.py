@@ -19,6 +19,7 @@ from simumax.core.base_struct import (
     async_recv_prev,
     async_wait_recv_next,
     async_wait_recv_prev,
+    async_wait_collective,
 )
 from simumax.core.config import StrategyConfig
 from simumax.core.utils import (
@@ -110,10 +111,17 @@ class OptimizerSimulator(MetaModule):
             and getattr(self.strategy, 'fsdp_mode', 'model-wise') == 'layer-wise'
         )
         if fsdp_layer_wise:
+            # Layer-wise FSDP tail: wait for all per-block RS to complete on
+            # the dp_comm lane, then optimizer step. RS ops were registered in
+            # thread_state.fsdp_rs_ops during LLMBlock._build_fsdp_rs_ops
+            # (FSDP2 gap analysis doc section 3.6, decision #3).
+            rs_ops = state.fsdp_rs_ops
+            rs_wait = async_wait_collective(
+                rs_ops, call_stk=f"{self.call_stk}-fsdp_rs_complete")
             optim_step = AtomModel(
                 fwd_cost=opt_info['optim_time'], bwd_cost=0,
                 specific_name='optimizer_step')
-            self._step_only_layers = [optim_step]
+            self._step_only_layers = [rs_wait, optim_step]
             for layer in self._step_only_layers:
                 layer.prefill(args, self.call_stk, com_buff=com_buff)
             return
@@ -192,15 +200,17 @@ class OptimizerSimulator(MetaModule):
         return fwd
 
     def prefill_step_only_fwd(self):
-        """Layer-wise FSDP tail: optimizer step only.
+        """Layer-wise FSDP tail: RS completion wait + optimizer step.
 
-        Returns a ``FwdQue`` wrapping just ``[AtomModel(optim_step)]``. The
-        per-block all-gather (fwd) and reduce-scatter (bwd) are injected into
-        each ``LLMBlock`` by ``language_model.py`` (blocking collectives), so
-        the OptimizerSimulator carries no RS/AG/world-barrier ops -- only the
-        optimizer update. Built only when ``zero_state >= 3`` and
-        ``fsdp_mode == "layer-wise"``; intended to be appended after the PP
-        backward. See ``docs/design_simu_zero3_fsdp.md`` section 5.2.
+        Returns a ``FwdQue`` wrapping ``[async_wait_collective(rs_ops),
+        AtomModel(optim_step)]``. The wait blocks the comp lane until all
+        per-block reduce-scatter CommEntries on the dp_comm lane have
+        completed, ensuring sharded gradients are ready before the optimizer
+        update. The per-block AG (fwd) and RS (bwd) are injected into each
+        ``LLMBlock`` by ``language_model.py`` (async post/wait collectives).
+        Built only when ``zero_state >= 3`` and ``fsdp_mode == "layer-wise"``;
+        intended to be appended after the PP backward.
+        See ``docs/design_simu_fsdp2_gap_analysis.md`` section 3.6.
         """
         fwd = FwdQue(call_stk=self.call_stk)
         for layer in self._step_only_layers:

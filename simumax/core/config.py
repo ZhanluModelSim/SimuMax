@@ -315,6 +315,18 @@ class StrategyConfig(Config):
     # meaningful when zero_state >= 3; validated and warned below if set
     # with a lower zero_state.
     fsdp_mode: str = "model-wise"
+    # FSDP sharding strategy (FSDP2 gap analysis doc section 3.1).
+    # True  = FULL_SHARD (FSDP2 default): params resharded after forward,
+    #          backward requires all-gather to re-unshard.
+    # False = SHARD_GRAD_OP: params stay unsharded after forward, backward
+    #          does not need all-gather. Only meaningful when zero_state >= 3
+    #          and fsdp_mode == "layer-wise".
+    reshard_after_forward: bool = True
+    # Number of layers to prefetch in layer-wise FSDP (FSDP2 gap analysis doc
+    # section 3.1). 1 = implicit prefetch (AG of next layer overlaps with
+    # current compute). 2+ = explicit prefetch (multiple AGs fly simultaneously).
+    # Only meaningful when zero_state >= 3 and fsdp_mode == "layer-wise".
+    fsdp_prefetch_layers: int = 1
 
     attention_sparse_ratio: float = (
         0.0  # 0.0 means dense attention; 0.5 means compute optimize for causal attention
@@ -747,6 +759,14 @@ class StrategyConfig(Config):
             warnings.warn(
                 "fsdp_mode has no effect when zero_state < 3"
             )
+        if self.zero_state >= 3:
+            assert self.fsdp_prefetch_layers >= 1, (
+                f"fsdp_prefetch_layers must be >= 1, got {self.fsdp_prefetch_layers}"
+            )
+            if self.fsdp_prefetch_layers > 1 and self.fsdp_mode != "layer-wise":
+                warnings.warn(
+                    "fsdp_prefetch_layers > 1 has no effect when fsdp_mode != 'layer-wise'"
+                )
         assert self.recompute_granularity is None or self.recompute_granularity in self.valid_recompute_granularity, f"recompute_granularity {self.recompute_granularity} must be in [{','.join(self.valid_recompute_granularity)}]"
         assert self.recompute_layer_num >= 0
         if not self.megatron_recompute:
