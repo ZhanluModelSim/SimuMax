@@ -118,6 +118,9 @@ class LLMBlock(MetaModule):
         # prefill_fwd/prefill_bwd stay byte-identical to the MetaModule default.
         self._fsdp_ag_ops = []
         self._fsdp_rs_ops = []
+        # Backward AG ops for FULL_SHARD (reshard_after_forward=True): separate
+        # op objects to avoid _eid collision with forward AG ops.
+        self._fsdp_bwd_ag_ops = []
         # Layer-wise FSDP overlap (docs/design_simu_zero3_fsdp.md section 5.2):
         # siblings used by the interleaved prefill_fwd/prefill_bwd. _next_block
         # / _prev_block are linked by LLMModel.prefill so each block can post
@@ -227,6 +230,8 @@ class LLMBlock(MetaModule):
         if self._is_layer_wise_fsdp:
             self._fsdp_ag_ops = self._build_fsdp_ag_ops(args, com_buff)
             self._fsdp_rs_ops = self._build_fsdp_rs_ops(args, com_buff)
+            if self.strategy.reshard_after_forward:
+                self._fsdp_bwd_ag_ops = self._build_fsdp_bwd_ag_ops(args, com_buff)
 
     @property
     def _is_layer_wise_fsdp(self):
@@ -321,26 +326,80 @@ class LLMBlock(MetaModule):
             state.comm_order += 1
         for op in ops:
             op.prefill(args, call_stk=self.call_stk, com_buff=com_buff)
+        # Register RS ops in thread state so OptimizerSimulator can wait for
+        # their completion before optimizer step (FSDP2 gap analysis doc
+        # section 3.6, decision #3).
+        state.fsdp_rs_ops.extend(ops)
+        return ops
+
+    def _build_fsdp_bwd_ag_ops(self, args, com_buff):
+        """Per-LLMBlock FSDP backward unshard POST ops (FULL_SHARD only).
+        Separate op objects from forward AG ops to avoid _eid collision.
+        These post AG in the backward phase (bwd_cost > 0, fwd_cost = 0),
+        mirroring the forward AG but for re-unsharding params that were
+        resharded after forward. See docs/design_simu_fsdp2_gap_analysis.md
+        section 3.2."""
+        state = args.thread_state
+        rank_info = get_rank_group(args.rank, self.strategy)
+        model_info = self._model_info
+        ops = []
+        dense_group_size = self.strategy.dp_size * self.strategy.cp_size
+        dense_ag_cost = self.system.compute_net_op_time(
+            "all_gather", model_info.dense_weight_bytes, dense_group_size,
+            net=self.strategy.dp_net, comm_stage="dp_cp",
+            strategy=self.strategy, group_kind="dp_cp",
+        )
+        ops.append(async_all_gather(
+            f"{state.comm_order}-fsdp_bwd_ag-dp_cp_group:{rank_info['dp_cp_group_id']}",
+            rank_info['dp_cp_rank'], dense_group_size,
+            fwd_cost=0, bwd_cost=dense_ag_cost, global_rank=args.rank,
+            stream="dp_comm",
+            net=self.strategy.dp_net, size_bytes=model_info.dense_weight_bytes))
+        ops[-1].call_stk = '-fsdp_bwd_ag'
+        state.comm_order += 1
+        if model_info.moe_weight_bytes > 0:
+            moe_group_size = self.strategy.edp_size
+            moe_ag_cost = self.system.compute_net_op_time(
+                "all_gather", model_info.moe_weight_bytes, moe_group_size,
+                net=self.strategy.edp_net, comm_stage="edp",
+                strategy=self.strategy, group_kind="edp",
+            )
+            ops.append(async_all_gather(
+                f"{state.comm_order}-fsdp_bwd_ag-edp_group:{rank_info['edp_group_id']}",
+                rank_info['edp_rank'], moe_group_size,
+                fwd_cost=0, bwd_cost=moe_ag_cost, global_rank=args.rank,
+                stream="dp_comm",
+                net=self.strategy.edp_net, size_bytes=model_info.moe_weight_bytes))
+            ops[-1].call_stk = '-fsdp_bwd_ag'
+            state.comm_order += 1
+        for op in ops:
+            op.prefill(args, call_stk=self.call_stk, com_buff=com_buff)
         return ops
 
     def prefill_fwd(self):
         fwd = super().prefill_fwd()
         if self._is_layer_wise_fsdp and self._fsdp_ag_ops:
-            # Interleaved layer-wise FSDP forward (design doc 5.2). Per block
-            # the FwdQue (FIFO) becomes:
-            #   [post AG(0)] -> [wait AG(this)] -> [post AG(next)] -> [compute]
-            # so the next block's AG runs on the comm lane DURING this block's
-            # compute on the comp lane. The first block prepends its own
-            # [post AG(0)] (no previous block to overlap with -> fully
-            # exposed); the last block has no next, so no trailing post.
+            # Interleaved layer-wise FSDP forward (FSDP2 gap analysis doc
+            # section 3.4). Per block the FwdQue (FIFO) becomes:
+            #   [wait AG(this)] -> [post AG(next+k) for k in 1..N] -> [compute]
+            # so the next block(s)' AG runs on the comm lane DURING this
+            # block's compute on the comp lane. The first block prepends its
+            # own [post AG(0)] (no previous block to overlap with -> fully
+            # exposed); blocks near the end have fewer successors to post.
+            prefetch = self.strategy.fsdp_prefetch_layers
             ag_this = self._fsdp_ag_ops
-            ag_next = self._next_block._fsdp_ag_ops if self._next_block else []
             head = [async_wait_collective(ag_this, call_stk=self.call_stk + '-fsdp_ag_wait')]
             if self._prev_block is None:
                 # First block: its own AG is posted then immediately waited
                 # (fully exposed, no overlap window available).
                 head = [op.prefill_fwd() for op in ag_this] + head
-            head += [op.prefill_fwd() for op in ag_next]
+            # Post AG for up to `prefetch` successors.
+            successor = self._next_block
+            for _ in range(prefetch):
+                if successor is None:
+                    break
+                head += [op.prefill_fwd() for op in successor._fsdp_ag_ops]
+                successor = successor._next_block
             fwd.que[0:0] = head
         elif self._fsdp_ag_ops:
             # Non-layer-wise path (kept for completeness): inject blocking AG
@@ -350,32 +409,49 @@ class LLMBlock(MetaModule):
 
     def prefill_bwd(self):
         bwd = super().prefill_bwd()
-        if self._is_layer_wise_fsdp and self._fsdp_rs_ops:
-            # Interleaved layer-wise FSDP backward (design doc 5.2). BwdStk is
-            # LIFO (pops end), so prepending [post RS(this), wait RS(next)] to
-            # the front makes the children backward pop FIRST (temporal order
-            # = compute bwd -> wait RS(next) -> post RS(this)):
-            #   - compute bwd(this): runs on the comp lane, overlapping the
-            #     RS posted by the previous (in bwd order) block on the comm
-            #     lane;
-            #   - wait RS(next): re-sync to that RS completion (stall only if
-            #     the RS outlives this block's compute -> the exposed tail);
-            #   - post RS(this): launch this block's reshard to overlap the
-            #     next (in bwd order) block's compute.
-            # The first bwd block (last fwd block, _next_block is None) has no
-            # RS to wait; the last bwd block (first fwd block, _prev_block is
-            # None) has no next bwd block, so its trailing post RS is exposed.
-            rs_this = self._fsdp_rs_ops
-            rs_next = self._next_block._fsdp_rs_ops if self._next_block else []
-            tail = [op.prefill_bwd() for op in rs_this]
-            if self._next_block is not None:
-                tail.append(async_wait_collective(rs_next, call_stk=self.call_stk + '-fsdp_rs_wait'))
-            bwd.stk[0:0] = tail
-        elif self._fsdp_rs_ops:
-            # Non-layer-wise path (kept for completeness): inject blocking RS
-            # ops popped last (after the block's children backward), identical
-            # to today.
-            bwd.stk[0:0] = [op.prefill_bwd() for op in self._fsdp_rs_ops]
+        if not self._is_layer_wise_fsdp or not self._fsdp_rs_ops:
+            return bwd
+        # Interleaved layer-wise FSDP backward (FSDP2 gap analysis doc
+        # section 3.5). BwdStk is LIFO (pops end); temporal order = pop
+        # order = list end→start. We structure the stk so temporal order is:
+        #
+        # FULL_SHARD (reshard_after_forward=True):
+        #   [wait AG(this)] → [post AG(next_bwd+k)] → [compute_bwd] → [post RS(this)]
+        # SHARD_GRAD_OP (reshard_after_forward=False):
+        #   [compute_bwd] → [post RS(this)]
+        #
+        # Key changes from old design (FSDP2 gap analysis doc section 2.2):
+        # - Deleted `wait RS(next)` sync point: RS is async post, no inter-
+        #   layer wait. Completion is synchronized only before optimizer step.
+        # - FULL_SHARD adds backward AG with prefetch, mirroring forward.
+        #
+        # BwdStk layout (index 0 = bottom = pops last = temporal last):
+        #   stk[0:0] = [post_RS]           → pops last  → temporal: after compute
+        #   stk.extend([wait_AG, post_AG_next...])  → pops first → temporal: before compute
+        reshard = self.strategy.reshard_after_forward
+
+        # Bottom: post RS(this) — temporal last (after compute_bwd)
+        bwd.stk[0:0] = [op.prefill_bwd() for op in self._fsdp_rs_ops]
+
+        if reshard and self._fsdp_bwd_ag_ops:
+            # FULL_SHARD: backward AG with prefetch
+            # Block links: _next_block = bwd predecessor (ran before us),
+            #              _prev_block = bwd successor (runs after us).
+            ag_this = self._fsdp_bwd_ag_ops
+            head = [async_wait_collective(ag_this, call_stk=self.call_stk + '-fsdp_bwd_ag_wait')]
+            if self._next_block is None:
+                # First backward block (last forward): self-post AG (exposed)
+                head = [op.prefill_bwd() for op in ag_this] + head
+            # Post AG for up to `prefetch` bwd successors (= _prev_block chain)
+            prefetch = self.strategy.fsdp_prefetch_layers
+            successor = self._prev_block
+            for _ in range(prefetch):
+                if successor is None:
+                    break
+                if successor._fsdp_bwd_ag_ops:
+                    head += [op.prefill_bwd() for op in successor._fsdp_bwd_ag_ops]
+                successor = successor._prev_block
+            bwd.stk.extend(head)
         return bwd
 
 

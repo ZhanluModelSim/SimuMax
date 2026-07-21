@@ -1534,6 +1534,12 @@ class AsyncP2PState:
 class State_Thread:
     def __init__(self):
         self.comm_order = 0
+        # Accumulates all layer-wise FSDP RS ops across microbatches for this
+        # thread (rank). LLMBlock._build_fsdp_rs_ops appends here; the
+        # OptimizerSimulator tail creates an async_wait_collective over this
+        # list to ensure all RS complete before optimizer step (FSDP2 gap
+        # analysis doc section 3.6, decision #3).
+        self.fsdp_rs_ops = []
 
 
 # Built-in resource lanes used when no system-level registry is supplied
@@ -3022,21 +3028,27 @@ class async_all_gather(LeafModel):
     The matching wait, placed later in the queue, re-syncs the comp lane to the
     AG completion.
 
+    Supports both forward and backward posts (FSDP2 gap analysis doc section
+    3.2/3.3). When ``reshard_after_forward=True`` (FULL_SHARD), the same op
+    posts in both fwd (unshard for forward) and bwd (re-unshard for backward).
+    Per-phase ``_posted`` flags ensure each phase posts exactly once.
+
     Issue logic mirrors ``Com._step`` (skip when cost==0 / group_size<=1;
     backend_kind ``local`` under merge_lanes) but never blocks and never raises
-    ``t["comp"]``. See docs/design_simu_zero3_fsdp.md section 5.2.
+    ``t["comp"]``. See docs/design_simu_fsdp2_gap_analysis.md section 3.3.
     """
     simu_kind = "comm"
 
-    def __init__(self, id, rank, group_size, fwd_cost=0, global_rank=None,
-                 stream="comm", net=None, size_bytes=0, call_stk=''):
+    def __init__(self, id, rank, group_size, fwd_cost=0, bwd_cost=0,
+                 global_rank=None, stream="comm", net=None, size_bytes=0,
+                 call_stk=''):
         super().__init__()
         self.call_stk = call_stk + f'-{self.__class__.__name__}'
         self.id = id
         self.rank = rank
         self.group_size = group_size
         self.fwd_cost = fwd_cost
-        self.bwd_cost = 0
+        self.bwd_cost = bwd_cost
         self.global_rank = global_rank
         self.stream = stream
         # Resolved strategy net name + payload size, forwarded into the posted
@@ -3044,7 +3056,8 @@ class async_all_gather(LeafModel):
         self.net = net
         self.size_bytes = size_bytes
         self._eid = None
-        self._posted = False
+        self._posted_fwd = False
+        self._posted_bwd = False
 
     def _issue_meta(self):
         return {"net": self.net, "size_bytes": self.size_bytes}
@@ -3069,7 +3082,8 @@ class async_all_gather(LeafModel):
         if cost == 0 or self.group_size <= 1:
             return True, None
         gid = (phase, self.id)
-        if self._posted:
+        posted_attr = f"_posted_{phase}"
+        if getattr(self, posted_attr):
             return True, None
         backend_kind, expected = self._backend_kind(ctx)
         self._eid = ctx.issue_comm_entry(
@@ -3094,14 +3108,14 @@ class async_all_gather(LeafModel):
             name=self.call_stk.split("-")[-1] + "-post",
         )
         ctx.pump_comm_queue()
-        self._posted = True
+        setattr(self, posted_attr, True)
         return False, ("yield_keep", gid)
 
     def _step(self, t, ctx):
         return self._post(t, ctx, "fwd")
 
     def _bwd(self, t, ctx):
-        return True, None
+        return self._post(t, ctx, "bwd")
 
     def step(self, t, ctx):
         return self._step(t, ctx)
@@ -3119,24 +3133,29 @@ class async_reduce_scatter(LeafModel):
     The layer-wise FSDP reshard mirror of ``async_all_gather``: the post runs
     in backward (``bwd_cost``) so the RS overlaps with the previous block's
     backward compute on the comp lane. Forward is a no-op (AG is fwd-only).
+
+    Supports per-phase ``_posted`` flags (FSDP2 gap analysis doc section 3.3)
+    for robustness, though RS currently only posts in backward.
     """
     simu_kind = "comm"
 
-    def __init__(self, id, rank, group_size, bwd_cost=0, global_rank=None,
-                 stream="comm", net=None, size_bytes=0, call_stk=''):
+    def __init__(self, id, rank, group_size, bwd_cost=0, fwd_cost=0,
+                 global_rank=None, stream="comm", net=None, size_bytes=0,
+                 call_stk=''):
         super().__init__()
         self.call_stk = call_stk + f'-{self.__class__.__name__}'
         self.id = id
         self.rank = rank
         self.group_size = group_size
-        self.fwd_cost = 0
+        self.fwd_cost = fwd_cost
         self.bwd_cost = bwd_cost
         self.global_rank = global_rank
         self.stream = stream
         self.net = net
         self.size_bytes = size_bytes
         self._eid = None
-        self._posted = False
+        self._posted_fwd = False
+        self._posted_bwd = False
 
     def _issue_meta(self):
         return {"net": self.net, "size_bytes": self.size_bytes}
@@ -3151,7 +3170,8 @@ class async_reduce_scatter(LeafModel):
         if cost == 0 or self.group_size <= 1:
             return True, None
         gid = (phase, self.id)
-        if self._posted:
+        posted_attr = f"_posted_{phase}"
+        if getattr(self, posted_attr):
             return True, None
         backend_kind, expected = self._backend_kind(ctx)
         self._eid = ctx.issue_comm_entry(
@@ -3174,11 +3194,11 @@ class async_reduce_scatter(LeafModel):
             name=self.call_stk.split("-")[-1] + "-post",
         )
         ctx.pump_comm_queue()
-        self._posted = True
+        setattr(self, posted_attr, True)
         return False, ("yield_keep", gid)
 
     def _step(self, t, ctx):
-        return True, None
+        return self._post(t, ctx, "fwd")
 
     def _bwd(self, t, ctx):
         return self._post(t, ctx, "bwd")
