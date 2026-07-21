@@ -5,7 +5,7 @@
 
 # Design Proposal: ZeRO-3 / FSDP Modeling
 
-- Status: **Draft v0.1** (design agreed in discussion, not yet implemented)
+- Status: **v1.0 (Phases 1-2 implemented)** (design agreed in discussion, implemented - phase 1 `ea42193`, phase 2 `faafe97`)
 - Date: 2026-07-17
 - Scope: ZeRO-3 (param sharding), per-layer and per-model FSDP communication,
   overlap modeling. Builds on the ZeRO-1 infrastructure already in the repo.

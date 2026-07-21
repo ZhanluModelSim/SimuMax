@@ -5,7 +5,7 @@
 
 # 设计方案：ZeRO-3 / FSDP 建模
 
-- 状态：**草案 v0.1**（讨论已定稿，尚未实现）
+- 状态：**v1.0（Phase 1-2 已实现）**（讨论已定稿，已实现 — phase 1 `ea42193`，phase 2 `faafe97`）
 - 日期：2026-07-17
 - 范围：ZeRO-3（参数分片）、per-layer 与 per-model 的 FSDP 通信、
   overlap 建模。建立在仓库已有的 ZeRO-1 基础设施之上。
