@@ -105,7 +105,9 @@ Key characteristics:
   `design_simu_cost_model_tunability.md` (+ `-zh` mirror) for planned
   per-operator cost-model tunability and declarative model recipes, and
   `design_simu_hierarchical_network.md` (+ `-zh` mirror) for planned
-  multi-level (node/pod/rack) network topology modeling.
+  multi-level (node/pod/rack) network topology modeling, and
+  `design_simu_zero3_fsdp.md` (+ `-zh` mirror) for planned ZeRO-3/FSDP
+  param sharding with layer-wise and model-wise modes.
 
 ## Build / Install / Run
 

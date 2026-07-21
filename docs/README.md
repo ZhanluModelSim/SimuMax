@@ -82,3 +82,7 @@ Recommended order:
   ([中文版本](./design_simu_hierarchical_network-zh.md)) — multi-level
   network topology (node/pod/rack), placement config, proportional
   comm-domain decomposition, and per-level cost composition.
+- [design_simu_zero3_fsdp.md](./design_simu_zero3_fsdp.md)
+  ([中文版本](./design_simu_zero3_fsdp-zh.md)) — ZeRO-3/FSDP param
+  sharding with layer-wise (per-block overlap) and model-wise
+  (whole-step) communication modes.
