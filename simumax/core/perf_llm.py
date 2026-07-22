@@ -1741,13 +1741,40 @@ class PerfLLM(PerfBase):
         if n == 0:
             return {"total_exposed_time": 0.0}
 
-        # Per-block fwd/bwd compute time = chunk compute / num_blocks. The
-        # overlap window is the block's own execution (compute + intra-net,
-        # recompute folded into bwd); p2p (inter-stage) is excluded since AG/RS
-        # overlap happens within a stage.
-        phase = self._compute_single_batch_phase_inputs(model_name)
-        fwd_per_block = phase["fwd_compute"] / n
-        bwd_per_block = phase["bwd_compute"] / n
+        # Per-block fwd/bwd compute time and FLOPS (design_simu_fsdp_mem_mfu_fix.md
+        # Part B.2/B.3). When the chunk is a live LLMModel, we read per-block
+        # cost_info and compute_info for heterogeneous layers (dense vs MoE).
+        # CachedChunkProfile fallback uses chunk-level uniform division.
+        fwd_per_block_list = []
+        bwd_per_block_list = []
+        fwd_flops_list = []
+        bwd_flops_list = []
+        if hasattr(chunk, 'layer_0'):
+            for i in range(n):
+                block = getattr(chunk, f'layer_{i}', None)
+                if block is None:
+                    fwd_per_block_list.append(0.0)
+                    bwd_per_block_list.append(0.0)
+                    fwd_flops_list.append(0)
+                    bwd_flops_list.append(0)
+                    continue
+                ci = block.get_cost_info()
+                fwd_per_block_list.append(ci.fwd_compute_time + ci.fwd_net_time)
+                bwd_per_block_list.append(
+                    ci.bwd_compute_time + ci.bwd_net_time
+                    + ci.recompute_compute_time + ci.recompute_net_time
+                )
+                fi = block.get_compute_info()
+                fwd_flops_list.append(fi.fwd_flops)
+                bwd_flops_list.append(fi.bwd_flops)
+        else:
+            phase = self._compute_single_batch_phase_inputs(model_name)
+            fi = chunk.get_compute_info()
+            for i in range(n):
+                fwd_per_block_list.append(phase["fwd_compute"] / n)
+                bwd_per_block_list.append(phase["bwd_compute"] / n)
+                fwd_flops_list.append(fi.fwd_flops // n)
+                bwd_flops_list.append(fi.bwd_flops // n)
 
         ag_list = []
         rs_list = []
@@ -1777,54 +1804,61 @@ class PerfLLM(PerfBase):
             ag_list.append(ag)
             rs_list.append(rs)
 
-        # Forward: AG for block i overlaps with fwd_compute of block i-1.
-        # Block 0 has no predecessor -> its AG is fully exposed.
+        # Forward: AG(i) overlaps with compute_fwd(i-1) — block i-1's forward
+        # posts AG(i) during its prefetch. Block 0's AG is fully exposed.
         fwd_ag_exposed = ag_list[0]
         for i in range(1, n):
-            fwd_ag_exposed += max(0.0, ag_list[i] - fwd_per_block)
+            fwd_ag_exposed += max(0.0, ag_list[i] - fwd_per_block_list[i - 1])
 
         reshard = getattr(self.strategy, 'reshard_after_forward', True)
         if reshard:
             # FULL_SHARD: backward also has AG. AG(i) overlaps with
-            # bwd_compute(i+1) (the block that runs before i in backward
-            # order and posts AG(i) during its prefetch). Block n-1 (first
-            # backward) has no predecessor -> AG(n-1) fully exposed.
+            # compute_bwd(i+1) — block i+1 (runs before i in backward order)
+            # posts AG(i) during its prefetch. Block n-1 (first backward)
+            # has no predecessor -> AG(n-1) fully exposed.
             bwd_ag_exposed = ag_list[n - 1]
             for i in range(n - 1):
-                bwd_ag_exposed += max(0.0, ag_list[i] - bwd_per_block)
+                bwd_ag_exposed += max(0.0, ag_list[i] - bwd_per_block_list[i + 1])
         else:
             bwd_ag_exposed = 0.0
 
-        # Backward: RS for block i overlaps with bwd_compute of block i-1
-        # (the next block in backward order). Block 0 (last backward) has
+        # Backward: RS(i) overlaps with compute_bwd(i-1) — block i-1
+        # (runs after i in backward order). Block 0 (last backward) has
         # no successor -> its RS is fully exposed.
         bwd_rs_exposed = rs_list[0]
         for i in range(1, n):
-            bwd_rs_exposed += max(0.0, rs_list[i] - bwd_per_block)
+            bwd_rs_exposed += max(0.0, rs_list[i] - bwd_per_block_list[i - 1])
 
         total_exposed = fwd_ag_exposed + bwd_ag_exposed + bwd_rs_exposed
 
-        # Per-block breakdown for the summary (FSDP2 gap analysis doc section 3.7).
-        # Each block's AG/RS cost and its overlap window (= adjacent block's
-        # compute time). exposed = max(0, comm - overlap_window).
+        # Per-block breakdown for the summary (design_simu_fsdp_mem_mfu_fix.md
+        # Part B.6). Each block's AG/RS cost, its overlap window (= adjacent
+        # block's compute time), exposed value, and overlap_mfu threshold.
+        # AG(i) overlaps with compute_fwd(i-1); RS(i) overlaps with
+        # compute_bwd(i-1); backward AG(i) overlaps with compute_bwd(i+1).
+        peak_tflops = self.system.accelerator.op["default"].tflops
         per_block = []
         for i in range(n):
-            fwd_overlap_window = fwd_per_block if i > 0 else 0.0
-            bwd_ag_overlap_window = bwd_per_block if (reshard and i < n - 1) else 0.0
-            bwd_rs_overlap_window = bwd_per_block if i > 0 else 0.0
-            block_fwd_exposed = ag_list[0] if i == 0 else max(0.0, ag_list[i] - fwd_per_block)
+            fwd_overlap_window = fwd_per_block_list[i - 1] if i > 0 else 0.0
+            bwd_ag_overlap_window = bwd_per_block_list[i + 1] if (reshard and i < n - 1) else 0.0
+            bwd_rs_overlap_window = bwd_per_block_list[i - 1] if i > 0 else 0.0
+            block_fwd_exposed = ag_list[0] if i == 0 else max(0.0, ag_list[i] - fwd_overlap_window)
             block_bwd_ag_exposed = (
                 ag_list[n - 1] if (reshard and i == n - 1)
-                else (max(0.0, ag_list[i] - bwd_per_block) if reshard else 0.0)
+                else (max(0.0, ag_list[i] - bwd_ag_overlap_window) if reshard else 0.0)
             )
             block_bwd_rs_exposed = (
                 rs_list[0] if i == 0
-                else max(0.0, rs_list[i] - bwd_per_block)
+                else max(0.0, rs_list[i] - bwd_rs_overlap_window)
             )
             per_block.append({
                 "block_idx": i,
                 "ag_time": ag_list[i],
                 "rs_time": rs_list[i],
+                "fwd_compute_time": fwd_per_block_list[i],
+                "bwd_compute_time": bwd_per_block_list[i],
+                "fwd_flops": fwd_flops_list[i],
+                "bwd_flops": bwd_flops_list[i],
                 "fwd_overlap_window": fwd_overlap_window,
                 "bwd_ag_overlap_window": bwd_ag_overlap_window,
                 "bwd_rs_overlap_window": bwd_rs_overlap_window,
@@ -1840,6 +1874,41 @@ class PerfLLM(PerfBase):
         total_comm = fwd_ag_total + bwd_ag_total + bwd_rs_total
         overlap_time = max(0.0, total_comm - total_exposed)
         overlap_pct = (overlap_time / total_comm * 100.0) if total_comm > 0 else 0.0
+
+        # overlap_mfu_requirements (design_simu_fsdp_mem_mfu_fix.md Part B):
+        # per-block MFU threshold at which compute_time = comm_time.
+        # overlap_mfu = flops_per_block / (comm_time_s × peak_TFLOPS × 1e12)
+        # Does NOT depend on duration or current_mfu — no circular dependency.
+        # ag_list/rs_list are in ms; convert to seconds for the formula.
+        overlap_mfu_per_block = []
+        for i in range(n):
+            ag_s = ag_list[i] / 1000.0  # ms → s
+            rs_s = rs_list[i] / 1000.0
+            fwd_ag_mfu = (
+                fwd_flops_list[i] / (ag_s * peak_tflops * 1e12)
+                if ag_s > 0 else 0.0
+            )
+            bwd_ag_mfu = (
+                bwd_flops_list[i] / (ag_s * peak_tflops * 1e12)
+                if (reshard and ag_s > 0) else None
+            )
+            bwd_rs_mfu = (
+                bwd_flops_list[i] / (rs_s * peak_tflops * 1e12)
+                if rs_s > 0 else 0.0
+            )
+            overlap_mfu_per_block.append({
+                "block_idx": i,
+                "fwd_flops": fwd_flops_list[i],
+                "bwd_flops": bwd_flops_list[i],
+                "fwd_ag_overlap_mfu": fwd_ag_mfu,
+                "bwd_ag_overlap_mfu": bwd_ag_mfu,
+                "bwd_rs_overlap_mfu": bwd_rs_mfu,
+            })
+        # Aggregate averages (simple mean of per-block values)
+        fwd_ag_vals = [b["fwd_ag_overlap_mfu"] for b in overlap_mfu_per_block]
+        bwd_rs_vals = [b["bwd_rs_overlap_mfu"] for b in overlap_mfu_per_block]
+        fwd_ag_avg = sum(fwd_ag_vals) / len(fwd_ag_vals) if fwd_ag_vals else 0.0
+        bwd_rs_avg = sum(bwd_rs_vals) / len(bwd_rs_vals) if bwd_rs_vals else 0.0
 
         return {
             "total_exposed_time": total_exposed,
@@ -1858,6 +1927,12 @@ class PerfLLM(PerfBase):
                 "rs_exposed": bwd_rs_exposed,
             },
             "per_block": per_block,
+            "overlap_mfu_requirements": {
+                "peak_tflops": peak_tflops,
+                "per_block": overlap_mfu_per_block,
+                "fwd_ag_overlap_mfu_avg": fwd_ag_avg,
+                "bwd_rs_overlap_mfu_avg": bwd_rs_avg,
+            },
         }
 
     def _analysis_mem_impl(
@@ -1938,29 +2013,60 @@ class PerfLLM(PerfBase):
         
         result["memory_reserved_ratio"] = str(self.strategy.mem_factor)
         result["peak_path"] = f"{cur_act_info.peak_path}, stage=[{cur_act_info.peak_stage}]"
-        # ZeRO-3 / FSDP analytical memory note (design doc section 4.3):
-        # for zero_state >= 3 the static weight bytes reported above are
-        # sharded, so peak_mem understates the true peak by the model-wise AG
-        # buffer (full unsharded params transiently live during fwd). The DES
-        # simulate() path models this transient buffer precisely; the
-        # analytical path does not (Phase 1 limitation).
+        # ZeRO-3 / FSDP analytical AG buffer (design_simu_fsdp_mem_mfu_fix.md
+        # Part A): for zero_state >= 3 the static weight bytes are sharded,
+        # so peak_mem must add the transient AG buffer (unsharded params).
+        # The AG buffer size depends on fsdp_mode and reshard_after_forward:
+        #   - FULL_SHARD layer-wise: (1+prefetch) × per_block_full_params
+        #   - SHARD_GRAD_OP layer-wise: full_chunk (params stay unsharded)
+        #   - model-wise: full_chunk (one big AG)
+        # Conservative overlay: AG buffer assumed to coexist with activation
+        # peak. DES simulate() path gives the precise value (Phase 2).
         if self.strategy.zero_state >= 3:
+            fsdp_mode = getattr(self.strategy, 'fsdp_mode', 'model-wise')
+            reshard = getattr(self.strategy, 'reshard_after_forward', True)
+            prefetch = getattr(self.strategy, 'fsdp_prefetch_layers', 1)
+            dp_group_size = self.strategy.dp_size * self.strategy.cp_size
+            edp_group_size = self.strategy.edp_size
+            chunk = self.model_chunk_dict[model_name]
+            chunk_layer_num = getattr(chunk, 'layer_num', 0)
+
+            if fsdp_mode == 'layer-wise' and reshard:
+                # FULL_SHARD layer-wise: peak = (1+prefetch) × per_block
+                if hasattr(chunk, 'layer_0'):
+                    block_mi = chunk.layer_0.get_model_info()
+                    per_block_dense = block_mi.dense_weight_bytes * dp_group_size
+                    per_block_moe = block_mi.moe_weight_bytes * edp_group_size
+                elif chunk_layer_num > 0:
+                    per_block_dense = (
+                        model_info.dense_weight_bytes * dp_group_size
+                        / chunk_layer_num)
+                    per_block_moe = (
+                        model_info.moe_weight_bytes * edp_group_size
+                        / chunk_layer_num)
+                else:
+                    per_block_dense = 0
+                    per_block_moe = 0
+                ag_dense = (1 + prefetch) * per_block_dense
+                ag_moe = (1 + prefetch) * per_block_moe
+            else:
+                # SHARD_GRAD_OP layer-wise or model-wise: full chunk
+                ag_dense = model_info.dense_weight_bytes * dp_group_size
+                ag_moe = model_info.moe_weight_bytes * edp_group_size
+
             result["peak_ag_buffer"] = {
-                "note": (
-                    "Model-wise FSDP AG buffer (full unsharded params, "
-                    "transiently live during fwd) is NOT included in "
-                    "peak_mem above; static weight bytes are sharded. Use "
-                    "simulate() for the precise peak memory that accounts "
-                    "for the transient AG buffer."
-                ),
-                "dense_full_param_bytes": (
-                    model_info.dense_weight_bytes
-                    * (self.strategy.dp_size * self.strategy.cp_size)
-                ),
-                "moe_full_param_bytes": (
-                    model_info.moe_weight_bytes * self.strategy.edp_size
-                ),
+                "fsdp_mode": fsdp_mode,
+                "reshard_after_forward": reshard,
+                "fsdp_prefetch_layers": prefetch if fsdp_mode == 'layer-wise' else None,
+                "dense_full_param_bytes": ag_dense,
+                "moe_full_param_bytes": ag_moe,
             }
+            # AG buffer is conservatively added to peak_mem (assumed to
+            # coexist with activation peak).
+            ag_buffer_bytes = ag_dense + ag_moe
+            result["peak_mem"] += ag_buffer_bytes
+            result["peak_mem_with_reserved"] = (
+                result["peak_mem"] / self.strategy.mem_factor)
         # Convert to human format
         convert_final_result_to_human_format(result)
         return result
