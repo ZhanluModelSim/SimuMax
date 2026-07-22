@@ -22,6 +22,7 @@ from simumax.core.simu_artifacts import (
     should_enable_simu_memory_timeline,
 )
 from simumax.core.simu_memory import SimuMemoryTracker
+from simumax.core.fsdp_summary import summarize_fsdp_trace
 from simumax.core.transformer.pipeline_schedule import OptimizerSimulator, PpSchedule
 from simumax.core.utils import get_pp_stage_representative_rank, get_rank_group
 
@@ -164,3 +165,13 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
     if ctx.memory_tracker is not None:
         append_memory_events_to_trace(output_json_path, ctx.memory_tracker)
         export_simu_memory_artifacts(save_path, ctx.memory_tracker, pickle_module=pickle)
+
+    # FSDP communication summary (FSDP2 gap analysis doc section 3.7):
+    # aggregate per-block AG/RS durations, exposed time, and overlap
+    # statistics from the DES trace. Only written when FSDP events exist.
+    fsdp_summary = summarize_fsdp_trace(output_json_path, save_path=save_path)
+    if fsdp_summary is not None:
+        t = fsdp_summary["total"]
+        print(f"FSDP summary: comm={t['total_comm_time']:.1f}us "
+              f"exposed={t['exposed_time']:.1f}us "
+              f"overlap={t['overlap_percentage']:.1f}%")

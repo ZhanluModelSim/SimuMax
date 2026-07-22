@@ -1674,8 +1674,9 @@ class PerfLLM(PerfBase):
             and getattr(self.strategy, 'fsdp_mode', 'model-wise') == 'layer-wise'
         )
         if fsdp_layer_wise:
-            all_result['dp_comm_exposed_time'] = (
-                self._compute_layer_wise_fsdp_exposed_time(model_name))
+            fsdp_breakdown = self._compute_layer_wise_fsdp_exposed_time(model_name)
+            all_result['dp_comm_exposed_time'] = fsdp_breakdown["total_exposed_time"]
+            all_result['fsdp_overlap_breakdown'] = fsdp_breakdown
         return all_result
 
     def _compute_layer_wise_fsdp_exposed_time(self, model_name):
@@ -1704,7 +1705,7 @@ class PerfLLM(PerfBase):
         chunk = self.model_chunk_dict[model_name]
         layer_num = getattr(chunk, 'layer_num', 0)
         if layer_num <= 0:
-            return 0.0
+            return {"total_exposed_time": 0.0}
 
         dp_group_size = self.strategy.dp_size * self.strategy.cp_size
         edp_group_size = self.strategy.edp_size
@@ -1738,7 +1739,7 @@ class PerfLLM(PerfBase):
                 ))
         n = len(block_infos)
         if n == 0:
-            return 0.0
+            return {"total_exposed_time": 0.0}
 
         # Per-block fwd/bwd compute time = chunk compute / num_blocks. The
         # overlap window is the block's own execution (compute + intra-net,
@@ -1778,9 +1779,9 @@ class PerfLLM(PerfBase):
 
         # Forward: AG for block i overlaps with fwd_compute of block i-1.
         # Block 0 has no predecessor -> its AG is fully exposed.
-        fwd_exposed = ag_list[0]
+        fwd_ag_exposed = ag_list[0]
         for i in range(1, n):
-            fwd_exposed += max(0.0, ag_list[i] - fwd_per_block)
+            fwd_ag_exposed += max(0.0, ag_list[i] - fwd_per_block)
 
         reshard = getattr(self.strategy, 'reshard_after_forward', True)
         if reshard:
@@ -1801,7 +1802,63 @@ class PerfLLM(PerfBase):
         for i in range(1, n):
             bwd_rs_exposed += max(0.0, rs_list[i] - bwd_per_block)
 
-        return fwd_exposed + bwd_ag_exposed + bwd_rs_exposed
+        total_exposed = fwd_ag_exposed + bwd_ag_exposed + bwd_rs_exposed
+
+        # Per-block breakdown for the summary (FSDP2 gap analysis doc section 3.7).
+        # Each block's AG/RS cost and its overlap window (= adjacent block's
+        # compute time). exposed = max(0, comm - overlap_window).
+        per_block = []
+        for i in range(n):
+            fwd_overlap_window = fwd_per_block if i > 0 else 0.0
+            bwd_ag_overlap_window = bwd_per_block if (reshard and i < n - 1) else 0.0
+            bwd_rs_overlap_window = bwd_per_block if i > 0 else 0.0
+            block_fwd_exposed = ag_list[0] if i == 0 else max(0.0, ag_list[i] - fwd_per_block)
+            block_bwd_ag_exposed = (
+                ag_list[n - 1] if (reshard and i == n - 1)
+                else (max(0.0, ag_list[i] - bwd_per_block) if reshard else 0.0)
+            )
+            block_bwd_rs_exposed = (
+                rs_list[0] if i == 0
+                else max(0.0, rs_list[i] - bwd_per_block)
+            )
+            per_block.append({
+                "block_idx": i,
+                "ag_time": ag_list[i],
+                "rs_time": rs_list[i],
+                "fwd_overlap_window": fwd_overlap_window,
+                "bwd_ag_overlap_window": bwd_ag_overlap_window,
+                "bwd_rs_overlap_window": bwd_rs_overlap_window,
+                "fwd_ag_exposed": block_fwd_exposed,
+                "bwd_ag_exposed": block_bwd_ag_exposed,
+                "bwd_rs_exposed": block_bwd_rs_exposed,
+            })
+
+        # Totals and overlap stats
+        fwd_ag_total = sum(ag_list)
+        bwd_ag_total = sum(ag_list) if reshard else 0.0
+        bwd_rs_total = sum(rs_list)
+        total_comm = fwd_ag_total + bwd_ag_total + bwd_rs_total
+        overlap_time = max(0.0, total_comm - total_exposed)
+        overlap_pct = (overlap_time / total_comm * 100.0) if total_comm > 0 else 0.0
+
+        return {
+            "total_exposed_time": total_exposed,
+            "total_comm_time": total_comm,
+            "overlap_time": overlap_time,
+            "overlap_percentage": overlap_pct,
+            "reshard_after_forward": reshard,
+            "fwd": {
+                "ag_total": fwd_ag_total,
+                "ag_exposed": fwd_ag_exposed,
+            },
+            "bwd": {
+                "ag_total": bwd_ag_total,
+                "ag_exposed": bwd_ag_exposed,
+                "rs_total": bwd_rs_total,
+                "rs_exposed": bwd_rs_exposed,
+            },
+            "per_block": per_block,
+        }
 
     def _analysis_mem_impl(
         self,
