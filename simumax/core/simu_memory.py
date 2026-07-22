@@ -41,6 +41,11 @@ class SimuMemoryTracker:
         self.static_bytes = defaultdict(int)
         self.cached_bytes = defaultdict(int)
         self.peak_bytes = defaultdict(int)
+        # FSDP transient AG buffer (unsharded params during AG/RS).
+        # Tracked separately from cached_bytes (activation cache) and
+        # static_bytes (sharded weights/grads/states). Alloc on AG post,
+        # free on RS post. See design_simu_fsdp_mem_mfu_fix.md Part A.3.2.
+        self._transient_bytes = defaultdict(int)
         self.events = []
         self.snapshots = []
         self._cache_token_id = 0
@@ -128,7 +133,8 @@ class SimuMemoryTracker:
 
     def _append_counter(self, rank, ts, allocated_bytes, phase, op_name, kind, scope=""):
         self.peak_bytes[rank] = max(self.peak_bytes[rank], int(allocated_bytes))
-        temp_bytes = max(0, int(allocated_bytes) - int(self.static_bytes[rank]) - int(self.cached_bytes[rank]))
+        temp_bytes = max(0, int(allocated_bytes) - int(self.static_bytes[rank])
+                         - int(self.cached_bytes[rank]) - int(self._transient_bytes[rank]))
         scope_tags = self._parse_scope_tags(scope)
         self.events.append(
             {
@@ -173,7 +179,7 @@ class SimuMemoryTracker:
         self._append_counter(rank, 0.0, self.static_bytes[rank], "init", "static", "init")
 
     def phase_start(self, rank, ts, profile: OpMemoryProfile, phase):
-        base = self.static_bytes[rank] + self.cached_bytes[rank]
+        base = self.static_bytes[rank] + self.cached_bytes[rank] + self._transient_bytes[rank]
         peak = base + profile.phase_peak_no_cache(phase)
         self._append_counter(rank, ts, base, phase, profile.op_name, "start", profile.cache_token_scope)
         self._append_counter(rank, ts + 1e-9, peak, phase, profile.op_name, "peak", profile.cache_token_scope)
@@ -183,8 +189,26 @@ class SimuMemoryTracker:
             self._allocate_cached_token(rank, ts, profile, phase, int(profile.cache_size_bytes))
         elif profile.phase_releases_cache(phase):
             self._free_cached_token(rank, ts, profile, phase)
-        total = self.static_bytes[rank] + self.cached_bytes[rank]
+        total = self.static_bytes[rank] + self.cached_bytes[rank] + self._transient_bytes[rank]
         self._append_counter(rank, ts, total, phase, profile.op_name, "end", profile.cache_token_scope)
+
+    def alloc_transient(self, rank, size, ts):
+        """FSDP AG allocates unsharded param buffer (design_simu_fsdp_mem_mfu_fix.md
+        Part A.3.2). Called by async_all_gather._post() / Com._step (model-wise AG)."""
+        r = rank if isinstance(rank, int) else int(rank)
+        self._transient_bytes[r] += int(size)
+        total = self.static_bytes[r] + self.cached_bytes[r] + self._transient_bytes[r]
+        self._append_counter(r, ts, total, "fwd" if True else "bwd",
+                             "fsdp_ag", "transient_alloc", "fsdp")
+
+    def free_transient(self, rank, size, ts):
+        """FSDP RS/reshard frees the unsharded buffer. Called by
+        async_reduce_scatter._post() / Com._step (model-wise RS)."""
+        r = rank if isinstance(rank, int) else int(rank)
+        self._transient_bytes[r] = max(0, self._transient_bytes[r] - int(size))
+        total = self.static_bytes[r] + self.cached_bytes[r] + self._transient_bytes[r]
+        self._append_counter(r, ts, total, "bwd",
+                             "fsdp_rs", "transient_free", "fsdp")
 
     def summary(self):
         return {
@@ -193,6 +217,9 @@ class SimuMemoryTracker:
             },
             "peak_allocated_bytes_by_rank": {
                 f"rank{rank}": int(v) for rank, v in sorted(self.peak_bytes.items())
+            },
+            "transient_ag_buffer_bytes_by_rank": {
+                f"rank{rank}": int(v) for rank, v in sorted(self._transient_bytes.items())
             },
         }
 

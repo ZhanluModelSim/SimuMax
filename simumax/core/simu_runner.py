@@ -130,7 +130,36 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
         pp_simu = PpSchedule(perf_model.strategy, perf_model.system, stage_models)
         if ctx.memory_tracker is not None:
             stage_static_bytes = sum(model.get_model_info().all for model in stage_models)
+            # FSDP AG buffer transient memory (design_simu_fsdp_mem_mfu_fix.md
+            # Part A.3.2): set as a static offset on top of sharded params.
+            # FULL_SHARD layer-wise: (1+prefetch) × per_block_full_params
+            # SHARD_GRAD_OP / model-wise: full_chunk_full_params
+            ag_buffer_bytes = 0
+            if perf_model.strategy.zero_state >= 3:
+                fsdp_mode = getattr(perf_model.strategy, 'fsdp_mode', 'model-wise')
+                reshard = getattr(perf_model.strategy, 'reshard_after_forward', True)
+                prefetch = getattr(perf_model.strategy, 'fsdp_prefetch_layers', 1)
+                dp_gs = perf_model.strategy.dp_size * perf_model.strategy.cp_size
+                edp_gs = perf_model.strategy.edp_size
+                mi = stage_models[0].get_model_info()
+                if fsdp_mode == 'layer-wise' and reshard:
+                    layer_num = getattr(stage_models[0], 'layer_num', 1)
+                    block_mi = (stage_models[0].layer_0.get_model_info()
+                                if hasattr(stage_models[0], 'layer_0') else mi)
+                    per_block = (block_mi.dense_weight_bytes * dp_gs
+                                 + block_mi.moe_weight_bytes * edp_gs)
+                    ag_buffer_bytes = (1 + prefetch) * per_block
+                else:
+                    ag_buffer_bytes = (mi.dense_weight_bytes * dp_gs
+                                       + mi.moe_weight_bytes * edp_gs)
             ctx.memory_tracker.init_rank(rank, stage_static_bytes)
+            if ag_buffer_bytes > 0:
+                ctx.memory_tracker._transient_bytes[rank] = int(ag_buffer_bytes)
+                # Record the initial transient allocation
+                total = stage_static_bytes + int(ag_buffer_bytes)
+                ctx.memory_tracker._append_counter(
+                    rank, 0.0, total, "fwd", "fsdp_ag_buffer",
+                    "transient_init", "fsdp")
 
         thread.job = pp_simu.prefill_batch(args, com_buff=None)
 
