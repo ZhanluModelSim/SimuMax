@@ -1842,6 +1842,12 @@ class ModelConfig(Config):
     vwn_n: int = 1                      # residual streams count
     vwn_m: int = 1                      # block output streams count
     vwn_layer_indices: list = None      # layer indices using VWN (None = none)
+    # ───  Quantized training config  ───
+    quant_dtype: str = "bf16"                    # activation quant dtype: "bf16" | "int8" | "fp8"
+    quant_mode: str = None                       # quant mode: None(no quant) | "dynamic" | "static"
+    attn_gate_quant: bool = False                # use ATTN_GATE_QUANT (vs CONTEXT_RMSNORM_QUANT)
+    context_rmsnorm_quant: bool = False          # use CONTEXT_RMSNORM_QUANT
+    moe_dispatch_quant: bool = False             # quantize MoE dispatch activations
     moe_ffn_hidden_size: int = None
     moe_shared_expert_intermediate_size: int = None
     v_head_dim: int = None
@@ -1875,6 +1881,13 @@ class ModelConfig(Config):
                 self.swa_kv_head_num = self.swa_head_num
             if self.swa_head_dim is None:
                 self.swa_head_dim = self.head_size
+        # Quant: attn_gate_quant and context_rmsnorm_quant are mutually exclusive
+        # (op_define: ATTN_GATE_QUANT 和 CONTEXT_RMSNORM_QUANT 二选一)
+        if self.attn_gate_quant and self.context_rmsnorm_quant:
+            raise ValueError(
+                "attn_gate_quant and context_rmsnorm_quant are mutually exclusive "
+                "(op_define: ATTN_GATE_QUANT 和 CONTEXT_RMSNORM_QUANT 二选一)"
+            )
 
     @classmethod
     def init_from_config_file(cls, config_file: str):

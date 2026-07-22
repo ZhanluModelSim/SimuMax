@@ -8,6 +8,7 @@ from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, Atten
 from simumax.core.transformer.dense_module import Embedding, Attention, MLAAttention, LayerNorm, LinearCol, MLP, ParallelCE
 from simumax.core.transformer.moe_module import ExpertMLP
 from simumax.core.transformer.vwn_module import VWNInModule, VWNOutModule
+from simumax.core.transformer.quant_module import ResidualAddRMSNormQuantModule
 from simumax.core.utils import format_scope_microbatch_tag, get_rank_group
 
 @dataclass
@@ -227,6 +228,27 @@ class LLMBlock(MetaModule):
         else:
             self.vwn_in = None
             self.vwn_out = None
+
+        # ───  Quantized pre-norm (ADD_RMS_NORM_QUANT) ───
+        # Replaces standard RMSNorm before attention / MLP when quant_mode is
+        # enabled. Created as children for cost-model aggregation; forward
+        # wiring is P1 (same pattern as VWN above).
+        quant_enabled = getattr(config, 'quant_mode', None) is not None
+        self.pre_attn_quant = None
+        self.pre_mlp_quant = None
+        if quant_enabled:
+            self.pre_attn_quant = ResidualAddRMSNormQuantModule(
+                hidden_size=config.hidden_size,
+                strategy=strategy,
+                system=system,
+                specific_name='PreAttn_ResidualAddRMSNormQuant',
+            )
+            self.pre_mlp_quant = ResidualAddRMSNormQuantModule(
+                hidden_size=config.hidden_size,
+                strategy=strategy,
+                system=system,
+                specific_name='PreMLP_ResidualAddRMSNormQuant',
+            )
 
     def forward(self, input_info:InputOutputInfo, path_debug_context:PathDebugContext):
         # NOTE: VWN forward integration not yet implemented —

@@ -14,6 +14,10 @@ from simumax.core.utils import format_model_info_microbatch_tag, get_rank_group
 import simumax.core.transformer.simu_ops as simu_ops
 from simumax.core.transformer.function import ConcatFunction,SplitFunction
 from simumax.core.transformer.swa_module import SWACoreAttention
+from simumax.core.transformer.quant_module import (
+    AttnGateQuantModule, RMSNormQuantModule,
+    FusedNormRoPEQuantStoreModule,
+)
 
 #region ------------------ Atomic module ------------------
 class Embedding(MetaModule):
@@ -2636,6 +2640,57 @@ class Attention(MetaModule):
                 system=system
             )
         self.attention.cache_outputs = self.strategy.use_flash_sdp and self.strategy.fp8
+
+        # ───  Fused Q/K Norm + RoPE + K/V Static Quant (FUSED_NORM_ROPE_QUANT_STORE) ───
+        # Sits between QKV proj and FlashAttention. Creates GQA and/or SWA branches
+        # from head config. Created as child for cost aggregation; forward wiring P1.
+        self.norm_rope_quant = None
+        quant_enabled = getattr(config, 'quant_mode', None) is not None
+        if quant_enabled:
+            gqa_qh = config.head_num - (config.swa_head_num or 0)
+            gqa_kvh = config.kv_head_num - (config.swa_kv_head_num or config.swa_head_num or 0)
+            swa_qh = config.swa_head_num or 0
+            swa_kvh = config.swa_kv_head_num or config.swa_head_num or 0
+
+            gqa_branch = (
+                {'qh': gqa_qh, 'kvh': gqa_kvh, 'hc': config.head_size}
+                if gqa_qh > 0 else None
+            )
+            swa_branch = (
+                {'qh': swa_qh, 'kvh': swa_kvh, 'hc': config.swa_head_dim or config.head_size}
+                if swa_qh > 0 else None
+            )
+            self.norm_rope_quant = FusedNormRoPEQuantStoreModule(
+                gqa_branch=gqa_branch,
+                swa_branch=swa_branch,
+                window_size=config.swa_window_size,
+                strategy=strategy,
+                system=system,
+            )
+
+        # ───  Quantized attention output (ATTN_GATE_QUANT / CONTEXT_RMSNORM_QUANT) ───
+        # These sit between FlashAttention output and O Proj, mutually exclusive.
+        # Created as children for cost-model aggregation; forward wiring is P1.
+        self.attn_quant = None
+        if config.attn_gate_quant:
+            attn_total_heads = config.head_num
+            swa_heads = config.swa_head_num or 0
+            gqa_heads = attn_total_heads - swa_heads
+            self.attn_quant = AttnGateQuantModule(
+                hidden_size=config.hidden_size,
+                gqa_h=gqa_heads,
+                swa_h=swa_heads,
+                head_dim=config.head_size,
+                strategy=strategy,
+                system=system,
+            )
+        elif config.context_rmsnorm_quant:
+            self.attn_quant = RMSNormQuantModule(
+                head_num=config.head_num,
+                head_dim=config.head_size,
+                strategy=strategy,
+                system=system,
+            )
 
     def forward(self, input_info:InputOutputInfo, path_debug_context:PathDebugContext):
         qkv = self.linear_qkv(input_info, path_debug_context)

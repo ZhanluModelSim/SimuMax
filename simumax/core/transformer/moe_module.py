@@ -1531,6 +1531,17 @@ class ExpertMLP(MetaModule):
                 strategy=strategy,
                 system=system,
             )
+        # NOTE: MoE dispatch/combine quantization cost (MOE_DISPATCH / MOE_COMBINE)
+        # is NOT created as standalone modules here to avoid double-counting
+        # communication (Permutation + UnPermutation already model all2all costs).
+        #
+        # Design decision (see design_plan_remaining_ops_costmodel.md §6.0):
+        #   Phase 3 方案 A — the quant FLOPS/memory-access formulas from
+        #   MoEDispatchModule / MoECombineModule (moe_comm_module.py) should be
+        #   extracted and added directly into Permutation.prefill() and
+        #   UnPermutation.prefill(). The standalone classes exist as formula
+        #   reference; they are not wired as children here.
+
         if (
             self.strategy.recompute_granularity == "selective_recompute"
             and mlp_recompute.megatron_layernorm
