@@ -18,6 +18,7 @@ Parameters (from op_define L126-131):
 """
 
 from simumax.core.base_struct import MetaModule, InputOutputInfo
+from simumax.core.tensor import TensorSize
 from simumax.core.config import StrategyConfig, SystemConfig
 
 
@@ -72,9 +73,7 @@ class VWNInModule(MetaModule):
         T = self._token_count
         return InputOutputInfo(
             tensors=[
-                __import__('simumax.core.tensor', fromlist=['TensorSize']).TensorSize(
-                    shape=(T, self.vwn_m, self.V)
-                )
+                TensorSize(shape=(T, self.vwn_m, self.V))
             ]
         )
 
@@ -189,13 +188,46 @@ class VWNInModule(MetaModule):
         # norm_weight[V] + gating_weight[V, G] + gating_bias[G]
         weight_bytes = (self.V + self.V * self.G + self.G) * element_size
         grad_bytes = weight_bytes
-        state_bytes = weight_bytes * 2  # optimizer state (Adam: m + v)
+        # Adam optimizer: fp32 master weight + m + v = 3×fp32×numel
         self._model_info.dense_weight_bytes = weight_bytes
         self._model_info.dense_grad_bytes = grad_bytes
-        self._model_info.dense_state_bytes = state_bytes
+        num_params = self.V + self.V * self.G + self.G
+        self._model_info.dense_state_bytes = (
+            3 * self.dtype_to_element_size["fp32"] * num_params
+        )
         self._model_info.moe_weight_bytes = 0
         self._model_info.moe_grad_bytes = 0
         self._model_info.moe_state_bytes = 0
+
+    # ───  Method 5: intra-net communication  ───
+    def _comp_leaf_intra_net_info(self):
+        # VWNIn has no TP/SP/EP communication
+        pass
+
+    # ───  Method 6: efficiency lookup  ───
+    def _comp_cost_info(self):
+        self._comp_cost_info_impl(
+            fwd_op="default",
+            bwd_grad_act_op="default",
+            bwd_grad_w_op="default",
+            enable_recompute=False,
+        )
+
+    # ───  prefill (DES simulation)  ───
+    def prefill(self, args, call_stk='', com_buff=None):
+        from simumax.core.base_struct import AtomModel
+        from simumax.core.utils import format_model_info_microbatch_tag
+        self.call_stk = call_stk + self.call_stk
+        self.layers.append(AtomModel(
+            fwd_cost=self._cost_info.fwd_compute_time,
+            bwd_cost=(
+                self._cost_info.bwd_grad_act_time
+                + self._cost_info.bwd_grad_w_time
+            ),
+            specific_name=self.specific_name,
+        ))
+        for layer in self.layers:
+            layer.prefill(args, self.call_stk, com_buff=com_buff)
 
 
 class VWNOutModule(MetaModule):
@@ -243,9 +275,7 @@ class VWNOutModule(MetaModule):
         T = self._token_count
         return InputOutputInfo(
             tensors=[
-                __import__('simumax.core.tensor', fromlist=['TensorSize']).TensorSize(
-                    shape=(T, self.vwn_n, self.V)
-                )
+                TensorSize(shape=(T, self.vwn_n, self.V))
             ]
         )
 
@@ -340,3 +370,33 @@ class VWNOutModule(MetaModule):
         self._model_info.moe_weight_bytes = 0
         self._model_info.moe_grad_bytes = 0
         self._model_info.moe_state_bytes = 0
+
+    # ───  Method 5: intra-net communication  ───
+    def _comp_leaf_intra_net_info(self):
+        # VWNOut has no TP/SP/EP communication
+        pass
+
+    # ───  Method 6: efficiency lookup  ───
+    def _comp_cost_info(self):
+        self._comp_cost_info_impl(
+            fwd_op="default",
+            bwd_grad_act_op="default",
+            bwd_grad_w_op="default",
+            enable_recompute=False,
+        )
+
+    # ───  prefill (DES simulation)  ───
+    def prefill(self, args, call_stk='', com_buff=None):
+        from simumax.core.base_struct import AtomModel
+        from simumax.core.utils import format_model_info_microbatch_tag
+        self.call_stk = call_stk + self.call_stk
+        self.layers.append(AtomModel(
+            fwd_cost=self._cost_info.fwd_compute_time,
+            bwd_cost=(
+                self._cost_info.bwd_grad_act_time
+                + self._cost_info.bwd_grad_w_time
+            ),
+            specific_name=self.specific_name,
+        ))
+        for layer in self.layers:
+            layer.prefill(args, self.call_stk, com_buff=com_buff)

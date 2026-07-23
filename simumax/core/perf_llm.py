@@ -16,6 +16,7 @@ from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, set_c
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.model_struct import ActivationInfo
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
+from simumax.core.transformer.bt_model import BTModel
 from simumax.core.graph import SimuONNXGraphBuilder, visualize_with_graphviz
 from simumax.core.simu_runner import run_simulation
 from simumax.core.trace_export import (
@@ -787,16 +788,27 @@ class PerfLLM(PerfBase):
                 self._prepared_chunk_names.add(chunk_name)
                 return
 
-            self.model_chunk_dict[chunk_name] = LLMModel(
-                layer_num=layer_num,
-                preprocess=preprocess,
-                postprocess=postprocess,
-                model_config=self.model_config,
-                strategy=self.strategy,
-                system=self.system,
-                dense_layers=dense_layers,
-                specific_name=specific_name,
-            )
+            if getattr(self.model_config, 'model_type', None) == 'bt_model':
+                self.model_chunk_dict[chunk_name] = BTModel(
+                    layer_num=layer_num,
+                    preprocess=preprocess,
+                    postprocess=postprocess,
+                    model_config=self.model_config,
+                    strategy=self.strategy,
+                    system=self.system,
+                    specific_name=specific_name,
+                )
+            else:
+                self.model_chunk_dict[chunk_name] = LLMModel(
+                    layer_num=layer_num,
+                    preprocess=preprocess,
+                    postprocess=postprocess,
+                    model_config=self.model_config,
+                    strategy=self.strategy,
+                    system=self.system,
+                    dense_layers=dense_layers,
+                    specific_name=specific_name,
+                )
 
         # Build First Stage Model Chunk
         # Only consider the even divide case fow now
@@ -3267,11 +3279,19 @@ class PerfLLM(PerfBase):
         final_duration_time_per_iter = max(duration_times)
         all_tokens_per_iter = self.strategy.seq_len * self.strategy.global_batch_size
         
-        theory_flops_per_token = self.model_config.flops_per_token(context_seq_len=self.strategy.seq_len, with_attn=True)
-        theory_flops = self.model_config.flops_per_token(context_seq_len=self.strategy.seq_len, with_attn=True) * all_tokens_per_iter //  self.strategy.world_size
+        # CP-adjusted SDP FLOPS (CP splits attention across GPUs)
+        cp = self.strategy.cp_size if hasattr(self.strategy, 'cp_size') else 1
+        fpt_full = self.model_config.flops_per_token(
+            context_seq_len=self.strategy.seq_len, with_attn=True)
+        if cp > 1:
+            sdp_per_token = 3 * 2 * self.model_config.layer_num * (2 * self.strategy.seq_len * self.model_config.hidden_size)
+            fpt = fpt_full - sdp_per_token + sdp_per_token // cp
+        else:
+            fpt = fpt_full
+        theory_flops = fpt * all_tokens_per_iter // self.strategy.world_size
         TGS = all_tokens_per_iter/(final_duration_time_per_iter/1000)/self.strategy.world_size
         TFLOPS = theory_flops / (final_duration_time_per_iter/1000)/1e12
-        TFLOPS_PER_TOKEN = theory_flops_per_token / (final_duration_time_per_iter/1000)/1e12
+        TFLOPS_PER_TOKEN = fpt / (final_duration_time_per_iter/1000)/1e12
         new_mfu_6nd_with_attn = TFLOPS / self.system.accelerator.op["default"].tflops
         
         mbc = self.strategy.micro_batch_num

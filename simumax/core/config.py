@@ -1924,6 +1924,9 @@ class ModelConfig(Config):
     swa_kv_head_num: int = None         # SWA KV head count (None = same as swa_head_num)
     swa_head_dim: int = None            # SWA head dim (None = use head_size)
     swa_window_size: int = 1028         # sliding window size (from op_define)
+    # ───  BT Model config  ───
+    enable_vwn: bool = False            # True = VWN 层, False = 标准层
+    use_attn_gate: bool = False         # True = AttnGate, False = ContextNorm
     # ───  VWN (Variable Window Network) config  ───
     vwn_n: int = 1                      # residual streams count
     vwn_m: int = 1                      # block output streams count
