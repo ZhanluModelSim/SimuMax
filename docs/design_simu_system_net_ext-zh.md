@@ -5,8 +5,9 @@
 
 # 设计方案：System 网络配置扩展
 
-- 状态：**v1.0（提案中）**
+- 状态：**v1.0（已实现）**
 - 日期：2026-07-22
+- 实现：Phase 1 `384d639`（FSDP net 选择器）、Phase 2 `0ea9e31`（FullMesh/CLOS 拓扑类型）、Phase 3（fabric 激活 + 文档）。
 - 范围：FSDP net 选择器、物理拓扑类型（FullMesh / CLOS）、fabric contention 在 shipped 配置中激活。
 - 前置依赖：`design_simu_network_fabric.md`（Phase A–C）、`design_simu_hierarchical_network.md`（Phase 1–3）、`design_simu_zero3_fsdp.md`、`design_simu_fsdp_mem_mfu_fix.md`。
 

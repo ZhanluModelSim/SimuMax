@@ -77,9 +77,11 @@ Key characteristics:
     mixtral, qwen3, kimi-1T, …).
   - `configs/strategy/` — parallelism strategies (tp/pp/ep/dp/mbs, recompute
     variants, sync-VPP example).
-  - `configs/system/` — machine configs (`a100_pcie.json`,
-    `b200_bf16_ceperm.json`) including per-shape `accurate_efficient_factor`
-    matmul entries and fitted `networks` values.
+  - `configs/system/` — machine configs (`a100_pcie.json` with
+    `fabric_model="nic"`, `b200_bf16_ceperm.json` with
+    `fabric_model="nic+tor"`) including per-shape
+    `accurate_efficient_factor` matmul entries and fitted `networks`
+    values.
 - `examples/` — runnable `perf_*.py` examples, `simulator_trace_snapshot.py`,
   `search_strategy_llama3_8b.py`, `search/llm_search.py`, `run_all.sh`.
   See `examples/README.md` for trace/snapshot artifact fields.
@@ -104,10 +106,13 @@ Key characteristics:
   for NIC-level cross-node contention modeling (implemented), and
   `design_simu_cost_model_tunability.md` (+ `-zh` mirror) for planned
   per-operator cost-model tunability and declarative model recipes, and
-  `design_simu_hierarchical_network.md` (+ `-zh` mirror) for planned
-  multi-level (node/pod/rack) network topology modeling, and
-  `design_simu_zero3_fsdp.md` (+ `-zh` mirror) for planned ZeRO-3/FSDP
-  param sharding with layer-wise and model-wise modes.
+  `design_simu_hierarchical_network.md` (+ `-zh` mirror) for
+  multi-level (node/pod/rack) network topology modeling (implemented),
+  `design_simu_zero3_fsdp.md` (+ `-zh` mirror) for ZeRO-3/FSDP
+  param sharding with layer-wise and model-wise modes (implemented),
+  and `design_simu_system_net_ext.md` (+ `-zh` mirror) for FSDP net
+  selector, physical topology types (FullMesh/CLOS), and fabric
+  contention activation in shipped configs (implemented).
 
 ## Build / Install / Run
 

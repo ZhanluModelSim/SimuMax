@@ -5,8 +5,11 @@
 
 # Design Proposal: System Network Configuration Extensions
 
-- Status: **v1.0 (proposed)**
+- Status: **v1.0 (implemented)**
 - Date: 2026-07-22
+- Implementation: phase 1 `384d639` (FSDP net selector),
+  phase 2 `0ea9e31` (FullMesh/CLOS topology types),
+  phase 3 (fabric activation + docs).
 - Scope: FSDP net selector, physical topology types (FullMesh / CLOS),
   fabric contention activation in shipped configs.
 - Builds on: `design_simu_network_fabric.md` (Phases A–C),

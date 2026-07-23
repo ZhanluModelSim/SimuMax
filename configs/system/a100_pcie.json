@@ -442,4 +442,6 @@
             }
         }
     }
+,
+    "fabric_model": "nic"
 }

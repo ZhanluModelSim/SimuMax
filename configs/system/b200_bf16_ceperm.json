@@ -896,5 +896,10 @@
         }
       }
     }
+  },
+  "fabric_model": "nic+tor",
+  "topology": {
+    "tor_capacity_gbps": 1600,
+    "tor_node_share": "auto"
   }
 }
