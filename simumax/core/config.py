@@ -955,6 +955,14 @@ class NetworkConfig:
     processor_usage: float  # for overlap
     bandwidth: BandwidthConfig
     op: Dict[str, OpConfig]
+    # Physical topology kind for this net profile (design doc
+    # design_simu_system_net_ext.md Part C, section 5.2). Used when
+    # topology.levels is not declared. "clos" (default) = shared uplink,
+    # bandwidth is divided by num_per_node (legacy behavior);
+    # "fullmesh" = dedicated per-pair links, bandwidth is not divided.
+    # Overridden by topology.levels[i]["kind"] when the hierarchical
+    # levels path is active.
+    topology_kind: str = "clos"
 
 
 @dataclass
@@ -1357,9 +1365,16 @@ class SystemConfig(Config):
 
         # Inter Bandwidth decision
         if net == "inter_node":
+            # Topology-kind-aware bandwidth (design doc Part C, section 5.4):
+            # CLOS: shared uplink → divide by convergence_ratio (default
+            #   num_per_node, preserving legacy behavior).
+            # FullMesh: dedicated per-pair links → no division.
+            topo_kind, conv_ratio = self._net_topology_kind(net)
+            clos_divisor = conv_ratio if topo_kind == "clos" else 1
+
             # 1. pp
             if op_name == "p2p":
-                bw /= self.num_per_node
+                bw /= clos_divisor
                 
             # 2. ep & a2a cp
             if op_name == "all2all":
@@ -1373,7 +1388,7 @@ class SystemConfig(Config):
                     actual_size = (k-1)/k * actual_size
                     
                     # decision bw
-                    bw /= self.num_per_node # bw of the single network card 
+                    bw /= clos_divisor # bw of the single network card 
                 elif "cp" in comm_stage.lower(): 
                     # Similar to ep all2all: when cp spans multiple nodes, only cross-node
                     # traffic contributes to inter-node transfer and each group is limited by one NIC.
@@ -1387,7 +1402,7 @@ class SystemConfig(Config):
                     else:
                         k = max(1, math.ceil(comm_num / self.num_per_node))
                         actual_size = (k - 1) / k * actual_size
-                    bw /= self.num_per_node
+                    bw /= clos_divisor
             
             # 3. tp+sp & ag cp & dp
             if op_name in ["all_reduce", "all_gather", "reduce_scatter"]:
@@ -1398,28 +1413,34 @@ class SystemConfig(Config):
                 # dp/dp_cp/edp NIC-contention divisions below are unchanged.
                 if group_kind in ("tp", "cp", "etp") and strategy is not None:
                     actual_size *= group_cross_node_ratio(group_kind, strategy, self.num_per_node)
-                if strategy is not None: 
-                    if is_dense_dp_stage:
-                        # zero0: all_reduce 
-                        # zero1: reduce_scatter & all_gather
-                        # num_per_node = 8
-                        # TP1, each DP group uses all 8 IBs
-                        # TP2, each DP group uses 4 IBs, ...
-                        #
-                        # Distinguish two semantics:
-                        # - `dp_cp`: dense optimizer group with CP folded into
-                        #   the group itself, so per-node group multiplicity is
-                        #   still driven by TP only.
-                        # - `dp`: pure dense DP group. If CP is present, each
-                        #   `(tp, cp)` slice owns its own DP group, so the
-                        #   inter-node contention factor grows with `tp * cp`.
-                        dense_group_multiplicity = strategy.tp_size
-                        if comm_stage == "dp":
-                            dense_group_multiplicity *= strategy.cp_size
-                        bw /= min(self.num_per_node, dense_group_multiplicity)
-                    elif comm_stage == "edp":
-                        # Same as dp
-                        bw /= min(self.num_per_node, strategy.ep_size*strategy.etp_size)
+                if strategy is not None:
+                    # Topology-kind: FullMesh skips the NIC-contention
+                    # division (dedicated per-pair links, no sharing);
+                    # CLOS keeps it (shared uplink). Design doc Part C,
+                    # section 5.4.
+                    if topo_kind == "clos":
+                        if is_dense_dp_stage:
+                            # zero0: all_reduce
+                            # zero1: reduce_scatter & all_gather
+                            # num_per_node = 8
+                            # TP1, each DP group uses all 8 IBs
+                            # TP2, each DP group uses 4 IBs, ...
+                            #
+                            # Distinguish two semantics:
+                            # - `dp_cp`: dense optimizer group with CP folded
+                            #   into the group itself, so per-node group
+                            #   multiplicity is still driven by TP only.
+                            # - `dp`: pure dense DP group. If CP is present,
+                            #   each `(tp, cp)` slice owns its own DP group,
+                            #   so the inter-node contention factor grows
+                            #   with `tp * cp`.
+                            dense_group_multiplicity = strategy.tp_size
+                            if comm_stage == "dp":
+                                dense_group_multiplicity *= strategy.cp_size
+                            bw /= min(self.num_per_node, dense_group_multiplicity)
+                        elif comm_stage == "edp":
+                            # Same as dp
+                            bw /= min(self.num_per_node, strategy.ep_size*strategy.etp_size)
                     
 
         base_latency = op.latency_us if op.latency_us is not None else net_data.bandwidth.latency_us
@@ -1462,6 +1483,32 @@ class SystemConfig(Config):
         if op_name == "p2p":
             return policies.get("p2p", "serial")
         return policies.get("collectives", "serial")
+
+    def _net_topology_kind(self, net: str):
+        """Resolve (topology_kind, convergence_ratio) for a net on the
+        legacy single-net path (design doc Part C, section 5.4).
+
+        1. If topology.levels exists and `net` matches a level's `net`,
+           return that level's kind / convergence_ratio.
+        2. Otherwise return networks[net].topology_kind / num_per_node
+           (default: "clos" with convergence_ratio = num_per_node,
+           preserving the legacy bw /= num_per_node behavior).
+        """
+        levels = (self.topology or {}).get("levels")
+        if levels:
+            for entry in levels:
+                if entry["net"] == net:
+                    kind = entry.get("kind", "clos")
+                    conv = entry.get("convergence_ratio", 1.0)
+                    return kind, conv
+        # Fallback: use the net profile's own topology_kind
+        net_cfg = self.networks.get(net)
+        if net_cfg is not None:
+            kind = getattr(net_cfg, 'topology_kind', 'clos')
+        else:
+            kind = "clos"
+        # Legacy default convergence_ratio = num_per_node for clos
+        return kind, self.num_per_node
 
     def _level_net_params(self, net: str, op_name: str, comm_num: int):
         """Resolve (scale, offset, eff_factor, bw_gbps, latency_us, fixed_latency_us)
@@ -1563,6 +1610,12 @@ class SystemConfig(Config):
         for i, span in enumerate(spans):
             scale, offset, eff_factor, bw, base_latency, fixed_latency = \
                 self._level_net_params(span.net, op_name, comm_num)
+            # Topology-kind-aware bandwidth (design doc Part C, section 5.5):
+            # CLOS levels divide by convergence_ratio; FullMesh levels keep
+            # the full link bandwidth (no sharing). Default kind="clos" with
+            # convergence_ratio=1.0 preserves the current levels behavior.
+            if span.kind == "clos" and span.convergence_ratio > 1.0:
+                bw /= span.convergence_ratio
             if op_name == "all2all":
                 # Per-level share of each member's traffic; levels whose
                 # boundary nobody crosses (fraction == 0) are skipped
@@ -1765,12 +1818,16 @@ class SystemConfig(Config):
                 self._validate_composition_policy(value)
 
     def _validate_topology_levels(self, levels):
-        """Validate topology["levels"] (hierarchical-network design doc section 3).
+        """Validate topology["levels"] (hierarchical-network design doc
+        section 3, system-net-ext design doc Part C section 5.1).
 
-        Levels are ordered innermost->outermost; each entry is exactly
-        {"name", "size", "net"} with size = units of the previous level
+        Levels are ordered innermost->outermost; each entry has required
+        keys {"name", "size", "net"} and optional keys {"kind",
+        "convergence_ratio"}. `size` = units of the previous level
         contained in this level (the first level's unit is one GPU, so its
         size must equal num_per_node). `net` must reference `networks`.
+        `kind` is "fullmesh" or "clos" (default "clos");
+        `convergence_ratio` is a positive float (default 1.0).
         """
         assert isinstance(levels, list) and len(levels) > 0, (
             f"topology['levels'] must be a non-empty list, but got {levels!r}"
@@ -1780,9 +1837,18 @@ class SystemConfig(Config):
             assert isinstance(entry, dict), (
                 f"topology['levels'][{idx}] must be a dict, but got {type(entry)}"
             )
-            assert set(entry.keys()) == {"name", "size", "net"}, (
-                f"topology['levels'][{idx}] must have exactly keys "
-                f"['name', 'net', 'size'], but got {sorted(entry.keys())}"
+            required_keys = {"name", "size", "net"}
+            optional_keys = {"kind", "convergence_ratio"}
+            entry_keys = set(entry.keys())
+            assert entry_keys.issuperset(required_keys), (
+                f"topology['levels'][{idx}] must have keys "
+                f"{sorted(required_keys)}, but got {sorted(entry_keys)}"
+            )
+            unknown = entry_keys - required_keys - optional_keys
+            assert not unknown, (
+                f"topology['levels'][{idx}] has unknown keys "
+                f"{sorted(unknown)}, allowed optional keys are "
+                f"{sorted(optional_keys)}"
             )
             name, size, net = entry["name"], entry["size"], entry["net"]
             assert isinstance(name, str) and name, (
@@ -1795,6 +1861,20 @@ class SystemConfig(Config):
             assert isinstance(net, str) and net in self.networks, (
                 f"topology['levels'][{idx}]['net'] must be one of "
                 f"{sorted(self.networks.keys())}, but got {net!r}"
+            )
+            kind = entry.get("kind", "clos")
+            assert kind in ("fullmesh", "clos"), (
+                f"topology['levels'][{idx}]['kind'] must be 'fullmesh' or "
+                f"'clos', but got {kind!r}"
+            )
+            conv = entry.get("convergence_ratio", 1.0)
+            assert (
+                isinstance(conv, (int, float))
+                and not isinstance(conv, bool)
+                and conv > 0
+            ), (
+                f"topology['levels'][{idx}]['convergence_ratio'] must be a "
+                f"positive number, but got {conv!r}"
             )
             assert name not in names, (
                 f"topology['levels'][{idx}]['name'] {name!r} is duplicated"

@@ -392,17 +392,23 @@ def group_cross_node_ratio(group_kind, strategy, num_per_node):
 class LevelSpan:
     """How one comm domain decomposes across one topology level."""
 
-    def __init__(self, name, size, net, span, units_touched, members_per_unit):
+    def __init__(self, name, size, net, span, units_touched, members_per_unit,
+                 kind="clos", convergence_ratio=1.0):
         self.name = name
         self.size = size
         self.net = net
         self.span = span                    # cumulative GPUs per unit
         self.units_touched = units_touched  # distinct units of this level
         self.members_per_unit = members_per_unit
+        # Physical topology type (design doc Part C): "fullmesh" = dedicated
+        # per-pair links; "clos" = shared switch uplink with convergence.
+        self.kind = kind
+        self.convergence_ratio = convergence_ratio
 
     def __repr__(self):
         return (f"LevelSpan({self.name}: size={self.size} net={self.net} "
-                f"units={self.units_touched} members/unit={self.members_per_unit:g})")
+                f"units={self.units_touched} members/unit={self.members_per_unit:g} "
+                f"kind={self.kind} conv={self.convergence_ratio})")
 
 
 def group_level_span(group_kind, strategy, levels):
@@ -432,8 +438,11 @@ def group_level_span(group_kind, strategy, levels):
         else:
             units = (group_size - 1) * stride // cumulative + 1
         members = group_size / units if units else 0.0
-        spans.append(LevelSpan(entry["name"], int(entry["size"]), entry["net"],
-                               cumulative, units, members))
+        spans.append(LevelSpan(
+            entry["name"], int(entry["size"]), entry["net"],
+            cumulative, units, members,
+            kind=entry.get("kind", "clos"),
+            convergence_ratio=entry.get("convergence_ratio", 1.0)))
     composition = []
     prev = group_size
     for span in spans:

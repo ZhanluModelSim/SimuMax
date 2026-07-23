@@ -76,11 +76,18 @@ def run_simulation(perf_model, save_path, merge_lanes=True):
         # topology["levels"] is required by the SystemConfig sanity check.
         levels = perf_model.system.topology["levels"]
         # Per-level link capacity in gbps, resolved from each level's net
-        # profile (level["net"] -> networks[net].bandwidth.gbps).
-        level_capacities = [
-            perf_model.system.networks[level["net"]].bandwidth.gbps
-            for level in levels
-        ]
+        # profile (level["net"] -> networks[net].bandwidth.gbps), with
+        # topology-kind-aware convergence (design doc Part C, section 5.6):
+        # CLOS levels divide by convergence_ratio; FullMesh levels keep
+        # full bandwidth (the level server is pass-through).
+        level_capacities = []
+        for level in levels:
+            net_bw = perf_model.system.networks[level["net"]].bandwidth.gbps
+            kind = level.get("kind", "clos")
+            conv = level.get("convergence_ratio", 1.0)
+            if kind == "clos" and conv > 1.0:
+                net_bw /= conv
+            level_capacities.append(net_bw)
         fabric = NetworkFabric(perf_model.system.num_per_node)
         fabric.set_level_topology(levels, level_capacities, merge_lanes)
     ctx.fabric = fabric
