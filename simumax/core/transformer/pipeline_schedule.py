@@ -63,13 +63,13 @@ class OptimizerSimulator(MetaModule):
                 f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}",
                 rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,
                 com_buff=com_buff, fwd_cost=cost_dense_ag, global_rank=args.rank,
-                net=self.strategy.dp_net, size_bytes=cost_dense['dp_comm_ag_size'])
+                net=self._fsdp_net_resolved, size_bytes=cost_dense['dp_comm_ag_size'])
             state.comm_order += 1
             cost_moe_ag = cost_moe['details']['all_gather_time']
             ag_moe = all_gather(
                 f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}",
                 rank_info['edp_rank'], self.strategy.edp_size, com_buff=com_buff,
-                fwd_cost=cost_moe_ag, global_rank=args.rank, net=self.strategy.edp_net,
+                fwd_cost=cost_moe_ag, global_rank=args.rank, net=self._fsdp_moe_net_resolved,
                 size_bytes=cost_moe['dp_comm_ag_size'])
             state.comm_order += 1
             self._unshard_layers = [ag_dense, ag_moe]
@@ -81,13 +81,13 @@ class OptimizerSimulator(MetaModule):
                 f"{state.comm_order}-dp_cp_group:{rank_info['dp_cp_group_id']}",
                 rank_info['dp_cp_rank'], self.strategy.dp_size * self.strategy.cp_size,
                 com_buff=com_buff, fwd_cost=cost_dense_rs, global_rank=args.rank,
-                net=self.strategy.dp_net)
+                net=self._fsdp_net_resolved)
             state.comm_order += 1
             cost_moe_rs = cost_moe['details']['reduce_scatter_time']
             rs_moe = reduce_scatter(
                 f"{state.comm_order}-edp_group:{rank_info['edp_group_id']}",
                 rank_info['edp_rank'], self.strategy.edp_size, com_buff=com_buff,
-                fwd_cost=cost_moe_rs, global_rank=args.rank, net=self.strategy.edp_net)
+                fwd_cost=cost_moe_rs, global_rank=args.rank, net=self._fsdp_moe_net_resolved)
             state.comm_order += 1
             barrier = all_reduce(
                 f"default_group-pp_size:{self.strategy.pp_size}",

@@ -364,7 +364,27 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     
     def set_variance_node(self, is_variance_node:bool):
         if self.use_variance_tail_model:
-            self.is_variance_node = is_variance_node        
+            self.is_variance_node = is_variance_node
+
+    @property
+    def _fsdp_net_resolved(self):
+        """Return fsdp_net if explicitly set, else the resolved dp_net
+        (design doc design_simu_system_net_ext.md Part A, section 3.2).
+        After analysis_net() runs, fsdp_net is already a concrete value;
+        this property is a safety fallback for direct DES access."""
+        fsdp_net = getattr(self.strategy, 'fsdp_net', 'auto')
+        if fsdp_net and fsdp_net != 'auto':
+            return fsdp_net
+        return self.strategy.dp_net
+
+    @property
+    def _fsdp_moe_net_resolved(self):
+        """Return fsdp_moe_net if explicitly set, else the resolved edp_net."""
+        fsdp_moe_net = getattr(self.strategy, 'fsdp_moe_net', 'auto')
+        if fsdp_moe_net and fsdp_moe_net != 'auto':
+            return fsdp_moe_net
+        return self.strategy.edp_net
+
     @property
     def output_info(self):
         if self.output_info_ is None:

@@ -453,7 +453,8 @@ class PerfBase(ABC):
         levels = (self.system.topology or {}).get("levels")
         if levels:
             for field in ("pp_net", "ep_net", "tp_net", "cp_net",
-                          "etp_net", "dp_net", "edp_net"):
+                          "etp_net", "dp_net", "edp_net",
+                          "fsdp_net", "fsdp_moe_net"):
                 if getattr(self.strategy, field) == "auto":
                     setattr(self.strategy, field, "levels")
             return
@@ -461,7 +462,31 @@ class PerfBase(ABC):
             self.analysis_pcie_net(re_analysis)
         else:
             self.analysis_high_link_net(re_analysis)
-    
+        # FSDP net: "auto" inherits the resolved dp_net / edp_net (design
+        # doc Part A, section 3.2). Must run AFTER the legacy resolution
+        # so dp_net/edp_net are already concrete net names.
+        if getattr(self.strategy, 'fsdp_net', 'auto') == 'auto':
+            self.strategy.fsdp_net = self.strategy.dp_net
+        if getattr(self.strategy, 'fsdp_moe_net', 'auto') == 'auto':
+            self.strategy.fsdp_moe_net = self.strategy.edp_net
+
+    @property
+    def _fsdp_net_resolved(self):
+        """Return fsdp_net if explicitly set, else the resolved dp_net
+        (design doc Part A, section 3.2)."""
+        fsdp_net = getattr(self.strategy, 'fsdp_net', 'auto')
+        if fsdp_net and fsdp_net != 'auto':
+            return fsdp_net
+        return self.strategy.dp_net
+
+    @property
+    def _fsdp_moe_net_resolved(self):
+        """Return fsdp_moe_net if explicitly set, else the resolved edp_net."""
+        fsdp_moe_net = getattr(self.strategy, 'fsdp_moe_net', 'auto')
+        if fsdp_moe_net and fsdp_moe_net != 'auto':
+            return fsdp_moe_net
+        return self.strategy.edp_net
+
     def capture(self, save_path):
         os.makedirs(save_path, exist_ok=True)
         print("Capture graph...")
@@ -1656,8 +1681,15 @@ class PerfLLM(PerfBase):
         else:
             moe_gather_comm_size = grad_bytes_to_param_bytes(model_info.moe_grad_bytes)
 
-        dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, self.strategy.dp_net, self.strategy.dp_size*self.strategy.cp_size, dp_group="dp_cp")
-        moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, self.strategy.edp_net, self.strategy.edp_size, dp_group="edp")
+        # Net selection: when zero_state >= 3 (FSDP), use fsdp_net /
+        # fsdp_moe_net if they were explicitly set; otherwise the resolved
+        # value already inherits dp_net / edp_net (design doc Part A).
+        dense_net = self._fsdp_net_resolved if self.strategy.zero_state >= 3 \
+            else self.strategy.dp_net
+        moe_net = self._fsdp_moe_net_resolved if self.strategy.zero_state >= 3 \
+            else self.strategy.edp_net
+        dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, dense_net, self.strategy.dp_size*self.strategy.cp_size, dp_group="dp_cp")
+        moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, moe_net, self.strategy.edp_size, dp_group="edp")
         all_result = {
             'dp_comm_exposed_time': dense_dp_result['dp_comm_exposed_time'] + moe_dp_result['dp_comm_exposed_time'],
             'dense': dense_dp_result,
@@ -1784,22 +1816,22 @@ class PerfLLM(PerfBase):
             if dense_w > 0 and dp_group_size > 1:
                 ag += self.system.compute_net_op_time(
                     "all_gather", dense_w, comm_num=dp_group_size,
-                    net=self.strategy.dp_net, comm_stage="dp_cp",
+                    net=self._fsdp_net_resolved, comm_stage="dp_cp",
                     strategy=self.strategy, group_kind="dp_cp")
             if dense_g > 0 and dp_group_size > 1:
                 rs += self.system.compute_net_op_time(
                     "reduce_scatter", dense_g, comm_num=dp_group_size,
-                    net=self.strategy.dp_net, comm_stage="dp_cp",
+                    net=self._fsdp_net_resolved, comm_stage="dp_cp",
                     strategy=self.strategy, group_kind="dp_cp")
             if moe_w > 0 and edp_group_size > 1:
                 ag += self.system.compute_net_op_time(
                     "all_gather", moe_w, comm_num=edp_group_size,
-                    net=self.strategy.edp_net, comm_stage="edp",
+                    net=self._fsdp_moe_net_resolved, comm_stage="edp",
                     strategy=self.strategy, group_kind="edp")
             if moe_g > 0 and edp_group_size > 1:
                 rs += self.system.compute_net_op_time(
                     "reduce_scatter", moe_g, comm_num=edp_group_size,
-                    net=self.strategy.edp_net, comm_stage="edp",
+                    net=self._fsdp_moe_net_resolved, comm_stage="edp",
                     strategy=self.strategy, group_kind="edp")
             ag_list.append(ag)
             rs_list.append(rs)

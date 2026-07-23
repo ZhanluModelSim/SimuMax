@@ -370,6 +370,12 @@ class StrategyConfig(Config):
     ep_net: Optional[str] = "auto"
     etp_net: Optional[str] = "auto"
     edp_net: Optional[str] = "auto"
+    # FSDP/ZeRO-3 param unshard (all_gather) and grad reshard
+    # (reduce_scatter) network selector. "auto" inherits the resolved
+    # dp_net (dense) / edp_net (MoE expert), fully backward-compatible.
+    # Only active when zero_state >= 3; zero_state < 3 is unaffected.
+    fsdp_net: Optional[str] = "auto"
+    fsdp_moe_net: Optional[str] = "auto"
 
     # Megatron related
     dispatch_probs: bool = False # The new version of Megatron combines probs in Silu after Groupgemm1 in ExpertMLP
