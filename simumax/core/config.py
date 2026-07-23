@@ -963,6 +963,13 @@ class NetworkConfig:
     # Overridden by topology.levels[i]["kind"] when the hierarchical
     # levels path is active.
     topology_kind: str = "clos"
+    # Optional overlay bandwidth (GB/s) from a parallel fabric that can be
+    # used simultaneously with this net's own bandwidth for p2p AND
+    # collectives (all_reduce/all_gather/reduce_scatter/all2all) in the
+    # levels cost path. Applied additively to `bandwidth.gbps`.
+    # Example: UBLink mesh (56 GB/s) + SU Clos overlay (224 GB/s) = 280 GB/s
+    # effective bandwidth within the SU domain for all communication patterns.
+    overlay_bandwidth_gbps: float = 0
 
 
 @dataclass
@@ -976,6 +983,11 @@ class SystemConfig(Config):
     real_comm_bw: dict = field(default_factory=OrderedDict)
     FC8: bool = False
     intra_with_pcie: bool = False
+    # Intra-node link type: "nvlink" (default), "pcie", or "ublink".
+    # "ublink" is Huawei's UBLink high-speed interconnect, equivalent in
+    # role to NVLink. Kept in sync with the legacy `intra_with_pcie`
+    # boolean (True iff intra_link_type == "pcie") for backward compat.
+    intra_link_type: str = "nvlink"
     miss_efficiency: dict = field(default_factory=OrderedDict)
     hit_efficiency: dict = field(default_factory=OrderedDict)
     # Extra hardware engine lanes (design doc 4.2), e.g.
@@ -1014,7 +1026,16 @@ class SystemConfig(Config):
         sys_name = config_dict.pop("sys_name")
         num_per_node = config_dict.pop("num_per_node")
         networks = config_dict.pop("networks")
-        intra_with_pcie = networks.pop('intra_with_pcie') if "intra_with_pcie" in networks else False
+        intra_link_type = networks.pop('intra_link_type', None)
+        if "intra_with_pcie" in networks:
+            intra_with_pcie = networks.pop('intra_with_pcie')
+            if intra_link_type is None:
+                intra_link_type = "pcie" if intra_with_pcie else "nvlink"
+        else:
+            intra_with_pcie = False
+        if intra_link_type is None:
+            intra_link_type = "nvlink"
+        intra_with_pcie = (intra_link_type == "pcie")
         accelerator = AcceleratorConfig(
             backend=accelerator["backend"],
             mem_gbs=accelerator["mem_gbs"],
@@ -1027,6 +1048,8 @@ class SystemConfig(Config):
                 processor_usage=network["processor_usage"],
                 bandwidth=BandwidthConfig(**network["bandwidth"]),
                 op={k: NetOpConfig(**v) for k, v in network["op"].items()},
+                overlay_bandwidth_gbps=network.get("overlay_bandwidth_gbps", 0),
+                topology_kind=network.get("topology_kind", "clos"),
             )
             for net_name, network in networks.items()
         }
@@ -1042,6 +1065,7 @@ class SystemConfig(Config):
             networks=networks,
             FC8=FC8,
             intra_with_pcie = intra_with_pcie,
+            intra_link_type = intra_link_type,
             engines=engines,
             fabric_model=fabric_model,
             topology=topology,
@@ -1538,7 +1562,15 @@ class SystemConfig(Config):
                 comm_num,
                 net_data.bandwidth.fixed_latency,
             )
-        return scale, offset, eff_factor, net_data.bandwidth.gbps, base_latency, fixed_latency
+        bw_gbps = net_data.bandwidth.gbps
+        # Overlay bandwidth: add a parallel fabric's bandwidth to model
+        # simultaneous use of mesh links + Clos fabric (e.g. UBLink
+        # mesh 56 GB/s + SU Clos overlay 224 GB/s = 280 GB/s effective).
+        # Applied to p2p AND collectives (all_reduce/all_gather/
+        # reduce_scatter/all2all) — the Clos fabric can be used in
+        # parallel with the mesh for all communication patterns.
+        bw_gbps += getattr(net_data, 'overlay_bandwidth_gbps', 0) or 0
+        return scale, offset, eff_factor, bw_gbps, base_latency, fixed_latency
 
     def _compute_net_op_time_levels(self, op_name: str, size: int, comm_num: int,
                                     comm_stage: str, strategy: "StrategyConfig",
@@ -1703,6 +1735,11 @@ class SystemConfig(Config):
     # composition_policy keys and values (design doc sections 3/6).
     COMPOSITION_POLICY_KEYS = ("all2all", "collectives", "p2p")
     COMPOSITION_POLICIES = ("max", "serial")
+    # Supported intra-node link types. "ublink" is Huawei's UBLink
+    # high-speed interconnect (equivalent in role to NVLink).
+    # "nvlink" and "ublink" share the same binary analysis path
+    # (analysis_high_link_net); "pcie" uses analysis_pcie_net.
+    INTRA_LINK_TYPES = ("nvlink", "pcie", "ublink")
 
     def simu_resource_lanes(self) -> list[str]:
         """Pinned resource-lane contract for the simulator (design doc 4.2).
@@ -1728,9 +1765,16 @@ class SystemConfig(Config):
         return build_fusion_policy(policy_spec).span(costs)
 
     def sanity_check(self):
+        self._sanity_check_intra_link_type()
         self._sanity_check_engines()
         self._sanity_check_fabric()
         self._sanity_check_operator_efficiency()
+
+    def _sanity_check_intra_link_type(self):
+        assert self.intra_link_type in self.INTRA_LINK_TYPES, (
+            f"intra_link_type must be one of {list(self.INTRA_LINK_TYPES)}, "
+            f"but got {self.intra_link_type!r}"
+        )
 
     def _sanity_check_operator_efficiency(self):
         _validate_efficiency_override_table(self.operator_efficiency, "operator_efficiency")

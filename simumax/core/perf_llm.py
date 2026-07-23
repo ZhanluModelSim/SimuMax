@@ -459,7 +459,7 @@ class PerfBase(ABC):
                 if getattr(self.strategy, field) == "auto":
                     setattr(self.strategy, field, "levels")
             return
-        if self.system.intra_with_pcie:
+        if self.system.intra_link_type == "pcie":
             self.analysis_pcie_net(re_analysis)
         else:
             self.analysis_high_link_net(re_analysis)

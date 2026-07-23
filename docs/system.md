@@ -331,6 +331,22 @@ Whether intra-node connection uses PCIe.
 }
 ```
 
+### intra_link_type
+Intra-node link type selector (optional, defaults to `"nvlink"`). Supported
+values:
+- `"nvlink"` — NVIDIA NVLink (default; equivalent to `intra_with_pcie: false`)
+- `"pcie"` — PCIe (equivalent to `intra_with_pcie: true`)
+- `"ublink"` — Huawei UBLink high-speed interconnect, equivalent in role to
+  NVLink; uses the same `low_intra_node` / `high_intra_node` / `inter_node`
+  profile structure and the same binary analysis path as NVLink
+
+When `intra_link_type` is present it takes precedence over
+`intra_with_pcie`. If only `intra_with_pcie` is present, the link type is
+derived as `"pcie"` (true) or `"nvlink"` (false). The two fields are kept
+in sync: `intra_with_pcie` is always `True` iff `intra_link_type == "pcie"`.
+This keeps existing configs bit-identical while allowing new configs to
+declare `"intra_link_type": "ublink"` without setting the boolean.
+
 ### intra_node_pcie_8x/intra_node_pcie_4x/intra_node_pcie_2x/low_intra_node/high_intra_node/inter_node   
 Each network bandwidth configuration includes the following parameters:
 - processor_usage: unused, reserved field     
@@ -338,6 +354,13 @@ Each network bandwidth configuration includes the following parameters:
     - efficient_factor: Network bandwidth efficiency
     - gbps: Network bandwidth, GB/s
     - latency_us: Network latency
+- overlay_bandwidth_gbps: optional, parallel fabric bandwidth (GB/s) that can
+  be used simultaneously with this net's own `bandwidth.gbps` for **p2p and
+  collectives** (all_reduce/all_gather/reduce_scatter/all2all) in the
+  `topology.levels` cost path. Applied additively:
+  `effective_bw = gbps + overlay_bandwidth_gbps`. Default 0.
+  Example: UBLink mesh (56 GB/s) with `overlay_bandwidth_gbps: 224` (SU Clos)
+  yields 280 GB/s effective bandwidth for all communication patterns.
 - op: Network bandwidth efficiency for specific operations, includes:
     - all_reduce: Network bandwidth efficiency for all_reduce operation
         - scale: 2, fixed
