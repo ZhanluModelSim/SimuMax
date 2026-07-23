@@ -1,0 +1,23 @@
+{
+    "tp_size": 1,
+    "pp_size": 2,
+    "cp_size": 8,
+    "ep_size": 16,
+    "world_size": 2048,
+    "micro_batch_size": 1,
+    "micro_batch_num": 8,
+    "seq_len": 131072,
+    "dtype": "bf16",
+    "enable_sequence_parallel": true,
+    "interleaving_size": 1,
+    "zero_state": 3,
+    "fsdp_mode": "layer-wise",
+    "reshard_after_forward": true,
+    "fsdp_prefetch_layers": 1,
+    "mem_factor": 0.94,
+    "enable_recompute": true,
+    "recompute_granularity": "full_block",
+    "recompute_layer_num": 32,
+    "attn_recompute": true,
+    "mlp_recompute": true
+}
