@@ -23,27 +23,45 @@ def resolve_config_dir(config_dir):
                 return target
     return config_dir
 
-def init_config_map(root):
+_core_config_root = os.path.join(root, 'core', 'configs') if os.path.isdir(os.path.join(root, 'core')) else None
+
+def init_config_map(config_root, core_config_root=None):
     def get_config_files(config_dir):
         config_dir = resolve_config_dir(config_dir)
         config_files = {}
-        for root, dirs, files in os.walk(config_dir):
+        for r, dirs, files in os.walk(config_dir):
             for file in files:
                 if file.endswith('.json'):
-                    config_files[file[:-5]] = os.path.join(root, file)
+                    config_files[file[:-5]] = os.path.join(r, file)
         config_files['root'] = config_dir
         return config_files
-    model_config_dir = os.path.join(root, 'models')
-    strategy_config_dir = os.path.join(root, 'strategy')
-    system_config_dir = os.path.join(root, 'system')    
 
-    models = get_config_files(model_config_dir)
-    strategy = get_config_files(strategy_config_dir)
-    systems = get_config_files(system_config_dir)   
+    def merge_to(base, extra_dir, label):
+        """Supplement base dict with entries from extra_dir (base keys win on collision)."""
+        if extra_dir and os.path.isdir(extra_dir):
+            extra = get_config_files(extra_dir)
+            for k, v in extra.items():
+                if k not in base:
+                    base[k] = v
+            if extra.get('root') and 'root' not in base:
+                base['root'] = extra['root']
+
+    models = get_config_files(os.path.join(config_root, 'models'))
+    strategy = get_config_files(os.path.join(config_root, 'strategy'))
+    systems = get_config_files(os.path.join(config_root, 'system'))
+
+    # Supplement from core submodule if present (e.g. SimuMax-Zhanlu-Enhance)
+    if core_config_root:
+        merge_to(models, os.path.join(core_config_root, 'models'), 'models')
+        merge_to(strategy, os.path.join(core_config_root, 'strategy'), 'strategy')
+        merge_to(systems, os.path.join(core_config_root, 'system'), 'system')
+
     return models, strategy, systems
 
-RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM = init_config_map(os.path.join(root, 'configs'))
-DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM = init_config_map(os.path.join(root, 'develop', 'configs'))
+RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM = init_config_map(
+    os.path.join(root, 'configs'), _core_config_root)
+DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM = init_config_map(
+    os.path.join(root, 'develop', 'configs'), _core_config_root)
 
 def get_config(key, version, r_maps:dict, d_maps:dict, m_type):
     if version == 'release':
