@@ -344,6 +344,8 @@ class SWACoreAttention(MetaModule):
                 comm_num=self.strategy.cp_size,
                 net=self.strategy.cp_net,
                 comm_stage=stage_name,
+                strategy=self.strategy,
+                group_kind="cp",
             )
             fwd_cost = cost if comm_cls is all2all_fwd else 0
             bwd_cost = cost if comm_cls is all2all_bwd else 0
@@ -397,6 +399,8 @@ class SWACoreAttention(MetaModule):
                                 comm_num=self.strategy.cp_size,
                                 net=self.strategy.cp_net,
                                 comm_stage=stage_name,
+                                strategy=self.strategy,
+                                group_kind="cp",
                             ),
                         )
             elif self.strategy.cp_comm_type == "all_gather":
@@ -405,14 +409,17 @@ class SWACoreAttention(MetaModule):
                     "all_gather", fwd_comm_size,
                     comm_num=self.strategy.cp_size, net=self.strategy.cp_net,
                     comm_stage="Attention_FWD_CP",
+                    strategy=self.strategy, group_kind="cp",
                 )
                 self._cost_info.bwd_net_time += self.system.compute_net_op_time(
                     "all_gather", fwd_comm_size,
                     comm_num=self.strategy.cp_size, net=self.strategy.cp_net,
                     comm_stage="Attention_BWD_CP1",
+                    strategy=self.strategy, group_kind="cp",
                 )
                 self._cost_info.bwd_net_time += self.system.compute_net_op_time(
                     "reduce_scatter", fwd_comm_size,
                     comm_num=self.strategy.cp_size, net=self.strategy.cp_net,
                     comm_stage="Attention_BWD_CP2",
+                    strategy=self.strategy, group_kind="cp",
                 )
