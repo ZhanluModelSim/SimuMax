@@ -60,12 +60,17 @@ class VWNInModule(MetaModule):
 
     @property
     def _token_count(self) -> int:
-        """Total token count T from input shape [T, VWN_N, V]."""
-        input_tensor = self.input_info.tensors[0]
-        if len(input_tensor.shape) == 3:
-            return input_tensor.size(0)
-        # 2D fallback: [T, VWN_N * V] → reshape implied
-        return input_tensor.size(0)
+        """Total token count T from input shape."""
+        t = self.input_info.tensors[0]
+        # Input: [B, S, H] → T = B × S
+        # Input: [T, VWN_N, V] → T = T (already flat)
+        if len(t.shape) == 3:
+            # Check if input is already flat [T, N, V] or batched [B, S, H]
+            # By convention, [T, N, V] has size(0) >> size(1)
+            if t.size(0) > t.size(1):
+                return int(t.size(0))
+            return int(t.size(0)) * int(t.size(1))
+        return int(t.size(0))
 
     def create_output_info(self):
         # VWNIn produces three outputs; the primary output is block_input
@@ -266,10 +271,13 @@ class VWNOutModule(MetaModule):
 
     @property
     def _token_count(self) -> int:
-        input_tensor = self.input_info.tensors[0]
-        if len(input_tensor.shape) == 3:
-            return input_tensor.size(0)
-        return input_tensor.size(0)
+        t = self.input_info.tensors[0]
+        if len(t.shape) == 3:
+            # [T, VWN_M, V] → T, or [B, S, C] → B×S
+            if t.size(0) > t.size(1):
+                return int(t.size(0))
+            return int(t.size(0)) * int(t.size(1))
+        return int(t.size(0))
 
     def create_output_info(self):
         T = self._token_count
