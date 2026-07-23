@@ -453,15 +453,25 @@ def group_level_span(group_kind, strategy, levels):
 
 
 def all2all_level_fraction(group_kind, strategy, levels, level_index):
-    """Fraction of an all2all member's traffic that crosses the given level's links.
+    """Fraction of an all2all member's traffic that uses the given level's links.
 
-    Peers inside the same unit do not cross: frac = (K - K/U_L) / (K - 1).
+    For the innermost level (index 0), ALL traffic uses its fabric since
+    there is no lower level to handle within-unit traffic: frac = 1.0.
+    For outer levels (index > 0), only peers in different units of this
+    level cross its boundary: frac = (K - members_per_unit) / (K - 1).
     """
     group_size, _ = _group_size_and_stride(group_kind, strategy)
     if group_size <= 1:
         return 0.0
     _, spans = group_level_span(group_kind, strategy, levels)
     span = spans[level_index]
+    if level_index == 0:
+        # Innermost level: all traffic uses this fabric (no lower level
+        # to offload within-unit traffic). Under the default "max" policy
+        # this only matters when the group fits entirely within one unit
+        # (e.g. EP=128 within a 128-GPU pod) — without this, the cost
+        # would be incorrectly 0.
+        return 1.0
     return (group_size - span.members_per_unit) / (group_size - 1)
 
 
