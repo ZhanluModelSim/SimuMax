@@ -16,7 +16,7 @@ from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, set_c
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.model_struct import ActivationInfo
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
-from simumax.core.transformer.bt_model import BTModel
+from simumax.core.transformer.mxx_model import MxxModel
 from simumax.core.graph import SimuONNXGraphBuilder, visualize_with_graphviz
 from simumax.core.simu_runner import run_simulation
 from simumax.core.trace_export import (
@@ -788,8 +788,8 @@ class PerfLLM(PerfBase):
                 self._prepared_chunk_names.add(chunk_name)
                 return
 
-            if getattr(self.model_config, 'model_type', None) == 'bt_model':
-                self.model_chunk_dict[chunk_name] = BTModel(
+            if getattr(self.model_config, 'model_type', None) == 'mxx_model':
+                self.model_chunk_dict[chunk_name] = MxxModel(
                     layer_num=layer_num,
                     preprocess=preprocess,
                     postprocess=postprocess,
