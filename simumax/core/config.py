@@ -1968,6 +1968,20 @@ class ModelConfig(Config):
     swa_kv_head_num: int = None         # SWA KV head count (None = same as swa_head_num)
     swa_head_dim: int = None            # SWA head dim (None = use head_size)
     swa_window_size: int = 1028         # sliding window size (from op_define)
+    # Per-layer SWA head count override. When set (list of length == layer_num),
+    # each layer uses layers_swa_head_num[i] instead of swa_head_num, so that
+    # the SWA/GQA ratio can vary across layers. None = backward-compatible,
+    # all layers use the global swa_head_num.
+    layers_swa_head_num: List[int] = None
+    # Per-layer SWA KV head count override (optional, requires layers_swa_head_num).
+    layers_swa_kv_head_num: List[int] = None
+    # Per-layer SWA head dim override (optional, requires layers_swa_head_num).
+    layers_swa_head_dim: List[int] = None
+    # Per-layer GQA KV head count override. When set (list of length == layer_num),
+    # each layer uses layers_kv_head_num[i] instead of kv_head_num, so that the GQA
+    # compression ratio (head_num // kv_head_num) can vary across layers independently
+    # of the SWA split. None = backward-compatible, all layers use the global kv_head_num.
+    layers_kv_head_num: List[int] = None
     # ───  BT Model config  ───
     enable_vwn: bool = False            # True = VWN 层, False = 标准层
     use_attn_gate: bool = False         # True = AttnGate, False = ContextNorm
